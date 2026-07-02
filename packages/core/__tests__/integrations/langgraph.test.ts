@@ -54,6 +54,17 @@ describe('instrumentLangGraph', () => {
     expect(body.spans[0].attributes['error.message']).toBe('graph failed');
   });
 
+  it('sets error.type attribute when invoke throws', async () => {
+    const graph = { invoke: vi.fn().mockRejectedValue(new Error('rate limit exceeded')) };
+    instrumentLangGraph(graph, client);
+
+    await expect(graph.invoke({})).rejects.toThrow('rate limit');
+    await client.flush();
+
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body) as TracePayload;
+    expect(body.spans[0].attributes['error.type']).toBe('rate_limit');
+  });
+
   it('is idempotent — second call does not double-wrap', async () => {
     const graph = makeGraphMock({});
     instrumentLangGraph(graph, client);

@@ -57,6 +57,18 @@ describe('instrumentOpenAIAgents', () => {
     expect(body.spans[0].attributes['error.message']).toBe('agent failed');
   });
 
+  it('sets error.type attribute when run() throws', async () => {
+    const agent = { name: 'helper', run: vi.fn().mockRejectedValue(new Error('fetch failed')) };
+    instrumentOpenAIAgents(agent, client);
+
+    await expect(agent.run('input')).rejects.toThrow('fetch failed');
+    await client.flush();
+
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body) as TracePayload;
+    const agentSpan = body.spans.find((s) => s.kind === 'agent_step')!;
+    expect(agentSpan.attributes['error.type']).toBe('network_error');
+  });
+
   it('is idempotent — second call does not double-wrap', async () => {
     const agent = { name: 'A', run: vi.fn().mockResolvedValue({}) };
 

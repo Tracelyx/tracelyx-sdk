@@ -1,5 +1,6 @@
 import { AsyncLocalStorage } from 'async_hooks';
 import { randomUUID } from 'crypto';
+import { classifyError } from './errors.js';
 import type { SpanKind, SpanPayload, TraceSpanOptions } from './types.js';
 
 export function parseTraceparent(header: string): { traceId: string; parentSpanId: string } | null {
@@ -57,6 +58,7 @@ export class Span {
     this.status = 'error';
     this.attrs['error.message'] = error.message;
     this.attrs['error.stack'] = error.stack ?? '';
+    this.attrs['error.type'] = classifyError(error);
   }
 
   end(attributes?: Record<string, unknown>, options?: { stateSnapshot?: string }): void {

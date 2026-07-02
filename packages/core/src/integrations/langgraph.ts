@@ -1,5 +1,6 @@
 import { randomUUID } from 'crypto';
 import { getActiveContext, runWithContext } from '../tracer.js';
+import { classifyError } from '../errors.js';
 import type { TracelyxClient } from '../client.js';
 import type { SpanPayload } from '../types.js';
 
@@ -99,6 +100,7 @@ export function instrumentLangGraph<T extends CompiledGraphLike>(
       return await runWithContext({ spanId, traceId }, () => originalInvoke(input, config));
     } catch (error) {
       status = 'error';
+      attributes['error.type'] = classifyError(error);
       if (error instanceof Error) {
         attributes['error.message'] = error.message;
         attributes['error.stack'] = error.stack;

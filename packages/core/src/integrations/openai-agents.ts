@@ -1,5 +1,6 @@
 import { randomUUID } from 'crypto';
 import { getActiveContext, runWithContext } from '../tracer.js';
+import { classifyError } from '../errors.js';
 import type { TracelyxClient } from '../client.js';
 import type { SpanPayload } from '../types.js';
 
@@ -42,6 +43,7 @@ function wrapTools(tools: ToolLike[], tracelyxClient: TracelyxClient, handoffTar
         return await originalToolFn(...args);
       } catch (error) {
         status = 'error';
+        attributes['error.type'] = classifyError(error);
         if (error instanceof Error) {
           attributes['error.message'] = error.message;
           attributes['error.stack'] = error.stack;
@@ -106,6 +108,7 @@ export function instrumentOpenAIAgents<T extends AgentLike>(
       return await runWithContext({ spanId, traceId, tenantId: ctx?.tenantId }, () => originalRun(...args));
     } catch (error) {
       status = 'error';
+      attributes['error.type'] = classifyError(error);
       if (error instanceof Error) {
         attributes['error.message'] = error.message;
         attributes['error.stack'] = error.stack;

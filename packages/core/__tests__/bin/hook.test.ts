@@ -122,4 +122,19 @@ describe('hook command', () => {
       JSON.stringify({ path: '/tmp/file.txt', content: 'sanitized' }),
     );
   });
+
+  it('sets error.type=hook_error and status=error when tool_error present', async () => {
+    vi.stubEnv('TRACELYX_API_KEY', 'tl_test');
+    vi.stubEnv('TRACELYX_PROJECT_ID', 'proj_1');
+
+    await runHookCommand(
+      ['--event', 'PostToolUse'],
+      JSON.stringify({ session_id: 's-1', tool_name: 'Bash', tool_error: 'command not found' }),
+    );
+
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body) as TracePayload;
+    expect(body.spans[0].status).toBe('error');
+    expect(body.spans[0].attributes['error.type']).toBe('hook_error');
+    expect(body.spans[0].attributes['hook.error']).toBe('command not found');
+  });
 });

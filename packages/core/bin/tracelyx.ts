@@ -20,6 +20,7 @@ function buildHookSpan(
   const now = Date.now();
   const executionMs =
     typeof hookData['execution_ms'] === 'number' ? hookData['execution_ms'] : 0;
+  const hasError = typeof hookData['tool_error'] === 'string';
 
   return {
     id: randomUUID(),
@@ -30,10 +31,11 @@ function buildHookSpan(
     startTime: now - executionMs,
     endTime: now,
     durationMs: executionMs,
-    status: 'ok',
+    status: hasError ? 'error' : 'ok',
     attributes: {
       'hook.name': hookName,
       'hook.session_id': sessionId,
+      ...(hasError && { 'error.type': 'hook_error' }),
       ...(hookData['tool_name'] !== undefined && { 'hook.tool_name': hookData['tool_name'] }),
       ...(hookData['tool_input'] !== undefined && {
         'hook.original_input': JSON.stringify(hookData['tool_input']),
@@ -44,7 +46,7 @@ function buildHookSpan(
       ...(typeof hookData['execution_ms'] === 'number' && {
         'hook.execution_ms': hookData['execution_ms'],
       }),
-      ...(typeof hookData['tool_error'] === 'string' && {
+      ...(hasError && {
         'hook.error': hookData['tool_error'],
       }),
       ...(hookData['modified_input'] !== undefined && {

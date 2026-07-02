@@ -44,4 +44,9 @@ describe('classifyError', () => {
     expect(classifyError(null)).toBe('unknown');
     expect(classifyError(undefined)).toBe('unknown');
   });
+
+  it('does not throw on error-like objects with non-string message', () => {
+    expect(classifyError({ message: 404 })).toBe('unknown');
+    expect(classifyError({ message: 404, status: 429 })).toBe('rate_limit');
+  });
 });

@@ -15,7 +15,7 @@ export function classifyError(error: unknown): ErrorType {
   if (error === null || typeof error !== 'object') return 'unknown';
 
   const err = error as { name?: string; message?: string; status?: number; code?: string };
-  const message = (err.message ?? '').toLowerCase();
+  const message = typeof err.message === 'string' ? err.message.toLowerCase() : '';
 
   if (err.status === 429 || message.includes('rate limit') || message.includes('too many requests')) {
     return 'rate_limit';

@@ -206,4 +206,26 @@ describe('instrumentLangGraph', () => {
     const lgSpan = body.spans.find((s) => s.name === 'langgraph.invoke')!;
     expect(lgSpan.tenantId).toBe('tenant-lg');
   });
+
+  it('node spans carry langgraph.node_name and langgraph.thread_id from config', async () => {
+    async function* fakeStream() {
+      yield { researcher: { results: ['a'] } };
+    }
+    const graph = {
+      invoke: vi.fn().mockResolvedValue({}),
+      stream: vi.fn().mockReturnValue(fakeStream()),
+    };
+    instrumentLangGraph(graph, client);
+
+    for await (const _chunk of (graph as any).stream({}, { configurable: { thread_id: 'thread-42' } })) {
+      // drain
+    }
+    await client.flush();
+
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body) as TracePayload;
+    const nodeSpan = body.spans.find((s) => s.name === 'langgraph.node.researcher')!;
+    expect(nodeSpan.attributes['langgraph.node_name']).toBe('researcher');
+    expect(nodeSpan.attributes['langgraph.node']).toBe('researcher');
+    expect(nodeSpan.attributes['langgraph.thread_id']).toBe('thread-42');
+  });
 });

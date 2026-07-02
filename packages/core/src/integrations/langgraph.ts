@@ -67,7 +67,13 @@ export function instrumentLangGraph<T extends CompiledGraphLike>(
               endTime: now,
               durationMs: now - prevTime,
               status: 'ok',
-              attributes: { 'langgraph.node': nodeName },
+              attributes: {
+                'langgraph.node': nodeName,
+                'langgraph.node_name': nodeName,
+                ...(config?.configurable?.thread_id !== undefined && {
+                  'langgraph.thread_id': config.configurable.thread_id,
+                }),
+              },
               tenantId: getActiveContext()?.tenantId,
             };
             tracelyxClient.recordSpan(nodeSpan);

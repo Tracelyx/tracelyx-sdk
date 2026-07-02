@@ -228,4 +228,57 @@ describe('instrumentLangGraph', () => {
     expect(nodeSpan.attributes['langgraph.node']).toBe('researcher');
     expect(nodeSpan.attributes['langgraph.thread_id']).toBe('thread-42');
   });
+
+  it('streamEvents patch emits node spans with accurate start/end pairing by run_id', async () => {
+    async function* fakeEvents() {
+      yield { event: 'on_chain_start', name: 'LangGraph', run_id: 'root', metadata: {} };
+      yield { event: 'on_chain_start', name: 'researcher', run_id: 'r1', metadata: { langgraph_node: 'researcher' } };
+      yield { event: 'on_chain_end', name: 'researcher', run_id: 'r1', metadata: { langgraph_node: 'researcher' } };
+      yield { event: 'on_chain_start', name: 'writer', run_id: 'w1', metadata: { langgraph_node: 'writer' } };
+      yield { event: 'on_chain_end', name: 'writer', run_id: 'w1', metadata: { langgraph_node: 'writer' } };
+      yield { event: 'on_chain_end', name: 'LangGraph', run_id: 'root', metadata: {} };
+    }
+    const graph = {
+      invoke: vi.fn().mockResolvedValue({}),
+      stream: vi.fn(),
+      streamEvents: vi.fn().mockReturnValue(fakeEvents()),
+    };
+    instrumentLangGraph(graph, client);
+
+    const seen: unknown[] = [];
+    for await (const ev of (graph as any).streamEvents({}, { version: 'v2' })) {
+      seen.push(ev);
+    }
+    await client.flush();
+
+    expect(seen).toHaveLength(6); // eventy przechodzą nietknięte
+
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body) as TracePayload;
+    const names = body.spans.map((s) => s.name).sort();
+    expect(names).toEqual(['langgraph.node.researcher', 'langgraph.node.writer']);
+    for (const span of body.spans) {
+      expect(span.kind).toBe('agent_step');
+      expect(span.attributes['langgraph.node_name']).toBeDefined();
+      expect(span.endTime).toBeGreaterThanOrEqual(span.startTime);
+    }
+  });
+
+  it('streamEvents ignores unmatched on_chain_end and non-node events', async () => {
+    async function* fakeEvents() {
+      yield { event: 'on_chat_model_stream', name: 'ChatAnthropic', run_id: 'x1', metadata: {} };
+      yield { event: 'on_chain_end', name: 'ghost', run_id: 'never-started', metadata: { langgraph_node: 'ghost' } };
+    }
+    const graph = {
+      invoke: vi.fn().mockResolvedValue({}),
+      streamEvents: vi.fn().mockReturnValue(fakeEvents()),
+    };
+    instrumentLangGraph(graph, client);
+
+    for await (const _ev of (graph as any).streamEvents({})) {
+      // drain
+    }
+    await client.flush();
+
+    expect(fetchMock).not.toHaveBeenCalled(); // zero spanów
+  });
 });

@@ -71,10 +71,11 @@ Subgraphs nest automatically: when an instrumented subgraph's `invoke()` runs in
 import { instrumentLangGraph } from '@tracelyx/core';
 
 const graph = new StateGraph(...);
-instrumentLangGraph(graph.compile(), tracelyx);
+const app = graph.compile();
+instrumentLangGraph(app, tracelyx);
 
 // Both stream() and streamEvents() are instrumented
-for await (const event of graph.streamEvents(input, { version: 'v2' })) {
+for await (const event of app.streamEvents(input, { version: 'v2' })) {
   // Per-node spans are created from on_chain_start/on_chain_end event pairs
 }
 ```
@@ -90,8 +91,10 @@ import { Agent, Runner } from '@openai/agents';
 const agent = new Agent(...);
 instrumentOpenAIAgents(agent, tracelyx);
 
-// or with a runner:
+// or with a runner (wraps the run in an agent_step span and instruments
+// the passed agent's tools/handoffs):
 const runner = new Runner();
+instrumentOpenAIAgents(runner, tracelyx);
 const result = await runner.run(agent, input);
 // Spans are still created with the same traceId across all agents
 ```

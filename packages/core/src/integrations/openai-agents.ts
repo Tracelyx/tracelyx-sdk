@@ -84,6 +84,8 @@ export function instrumentOpenAIAgents<T extends AgentLike>(
 ): T {
   const agentAsAny = agent as any;
   if (agentAsAny[INSTRUMENTED]) return agent;
+  // Mark before wrapping/recursion so handoff cycles (A <-> B) terminate.
+  agentAsAny[INSTRUMENTED] = true;
 
   const originalRun = agentAsAny.run.bind(agentAsAny);
   const agentName = agentAsAny.name ?? 'unknown';
@@ -156,6 +158,5 @@ export function instrumentOpenAIAgents<T extends AgentLike>(
     }
   };
 
-  agentAsAny[INSTRUMENTED] = true;
   return agent;
 }

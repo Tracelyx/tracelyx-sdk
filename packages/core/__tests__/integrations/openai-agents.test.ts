@@ -299,4 +299,19 @@ describe('instrumentOpenAIAgents', () => {
     const toolSpan = body.spans.find((s) => s.kind === 'tool_call')!;
     expect(toolSpan.attributes['handoff.target_agent']).toBe('billing');
   });
+
+  it('does not infinitely recurse on mutual handoff cycles (A <-> B)', async () => {
+    const agentA: any = { name: 'a', handoffs: [] as any[], run: vi.fn().mockResolvedValue('ok') };
+    const agentB: any = { name: 'b', handoffs: [agentA], run: vi.fn().mockResolvedValue('ok') };
+    agentA.handoffs.push(agentB);
+
+    expect(() => instrumentOpenAIAgents(agentA, client)).not.toThrow();
+
+    await agentA.run('x');
+    await agentB.run('y');
+    await client.flush();
+
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body) as TracePayload;
+    expect(body.spans.map((s: any) => s.name).sort()).toEqual(['agent.a', 'agent.b']);
+  });
 });

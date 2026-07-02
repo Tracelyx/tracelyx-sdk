@@ -17,6 +17,7 @@ interface AgentLike {
   name?: string;
   model?: string;
   tools?: ToolLike[];
+  handoffs?: unknown[];
   run(...args: unknown[]): Promise<unknown>;
   [key: string | symbol]: unknown;
 }
@@ -52,7 +53,9 @@ function wrapTools(tools: ToolLike[], tracelyxClient: TracelyxClient, handoffTar
       } finally {
         const endTime = Date.now();
         if (toolName.startsWith('transfer_to_')) {
-          handoffTargets.add(toolName.slice('transfer_to_'.length));
+          const target = toolName.slice('transfer_to_'.length);
+          handoffTargets.add(target);
+          attributes['handoff.target_agent'] = target;
         }
         const toolSpan: SpanPayload = {
           id: toolSpanId,
@@ -88,6 +91,22 @@ export function instrumentOpenAIAgents<T extends AgentLike>(
 
   if (Array.isArray(agentAsAny.tools)) {
     wrapTools(agentAsAny.tools as ToolLike[], tracelyxClient, handoffTargets);
+  }
+
+  if (Array.isArray(agentAsAny.handoffs)) {
+    for (const handoff of agentAsAny.handoffs) {
+      const target =
+        handoff !== null && typeof handoff === 'object' && 'agent' in (handoff as object)
+          ? (handoff as { agent: unknown }).agent
+          : handoff;
+      if (
+        target !== null &&
+        typeof target === 'object' &&
+        typeof (target as AgentLike).run === 'function'
+      ) {
+        instrumentOpenAIAgents(target as AgentLike, tracelyxClient);
+      }
+    }
   }
 
   agentAsAny.run = async function (...args: unknown[]): Promise<unknown> {

@@ -241,4 +241,62 @@ describe('instrumentOpenAIAgents', () => {
     const toolSpan = body.spans.find((s) => s.name === 'tool.do_thing')!;
     expect(toolSpan.tenantId).toBe('tenant-abc');
   });
+
+  it('auto-instruments handoff target agents so trace propagates through handoffs', async () => {
+    const billingAgent: any = {
+      name: 'billing',
+      run: vi.fn().mockResolvedValue('billing done'),
+    };
+    const triageAgent: any = {
+      name: 'triage',
+      handoffs: [billingAgent],
+      run: vi.fn().mockImplementation(async () => billingAgent.run('handed off')),
+    };
+    instrumentOpenAIAgents(triageAgent, client);
+
+    await triageAgent.run('help me with my invoice');
+    await client.flush();
+
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body) as TracePayload;
+    const triageSpan = body.spans.find((s) => s.name === 'agent.triage')!;
+    const billingSpan = body.spans.find((s) => s.name === 'agent.billing')!;
+    expect(billingSpan.traceId).toBe(triageSpan.traceId);
+    expect(billingSpan.parentSpanId).toBe(triageSpan.id);
+  });
+
+  it('supports handoff objects wrapping the agent ({ agent } shape)', async () => {
+    const target: any = { name: 'refunds', run: vi.fn().mockResolvedValue('ok') };
+    const source: any = {
+      name: 'support',
+      handoffs: [{ agent: target, toolName: 'transfer_to_refunds' }],
+      run: vi.fn().mockResolvedValue('ok'),
+    };
+    instrumentOpenAIAgents(source, client);
+
+    await target.run('direct call after handoff');
+    await client.flush();
+
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body) as TracePayload;
+    expect(body.spans.some((s) => s.name === 'agent.refunds')).toBe(true);
+  });
+
+  it('sets handoff.target_agent attribute on the transfer_to_ tool span', async () => {
+    const transferTool: any = {
+      name: 'transfer_to_billing',
+      on_invoke_tool: vi.fn().mockResolvedValue('transferred'),
+    };
+    const agent: any = {
+      name: 'triage',
+      tools: [transferTool],
+      run: vi.fn().mockImplementation(async () => transferTool.on_invoke_tool({}, '{}')),
+    };
+    instrumentOpenAIAgents(agent, client);
+
+    await agent.run('input');
+    await client.flush();
+
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body) as TracePayload;
+    const toolSpan = body.spans.find((s) => s.kind === 'tool_call')!;
+    expect(toolSpan.attributes['handoff.target_agent']).toBe('billing');
+  });
 });

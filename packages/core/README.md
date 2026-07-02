@@ -52,20 +52,20 @@ try {
   // ...
 } catch (err) {
   const errorType = classifyError(err);
-  console.log(errorType); // 'rate_limit', 'timeout', etc.
+  console.log(errorType); // 'rate_limit', 'tool_timeout', etc.
 }
 ```
 
 ### LangGraph
 
-LangGraph integration instruments both `stream()` and `streamEvents()` calls, creating per-node spans with exact timing. Requires `@langchain/langgraph >= 0.2.0`.
+LangGraph integration instruments both `stream()` and `streamEvents()` calls, creating per-node spans. `streamEvents()` gives accurate per-node start/end times (from `on_chain_start`/`on_chain_end` events; requires `@langchain/langgraph >= 0.2.0`), while `stream()` approximates node duration as the time between successive chunks.
 
 Emitted attributes:
 - `langgraph.node_name` — the executed node
 - `langgraph.thread_id` — conversation thread ID
 - `langgraph.checkpoint_id` — checkpoint for replays
 
-Subgraphs are automatically nested: a subgraph invocation creates a parent `langgraph.node_name` span containing child spans for each internal node.
+Subgraphs nest automatically: when an instrumented subgraph's `invoke()` runs inside an instrumented parent graph's `invoke()`, the subgraph's span becomes a child of the parent's span (same trace, parent/child linked via `AsyncLocalStorage`). Per-node spans come separately from `stream()`/`streamEvents()`.
 
 ```typescript
 import { instrumentLangGraph } from '@tracelyx/core';
@@ -73,15 +73,15 @@ import { instrumentLangGraph } from '@tracelyx/core';
 const graph = new StateGraph(...);
 instrumentLangGraph(graph.compile(), tracelyx);
 
-// Both synchronous and async streaming are instrumented
+// Both stream() and streamEvents() are instrumented
 for await (const event of graph.streamEvents(input, { version: 'v2' })) {
-  // Each event generates a span
+  // Per-node spans are created from on_chain_start/on_chain_end event pairs
 }
 ```
 
 ### OpenAI Agents
 
-`instrumentOpenAIAgents()` accepts either an agent or a runner. Multi-agent runs with handoffs automatically propagate a single trace across all agents — all spans share the same `traceId`. Handoff detection records `handoff.target_agent` on each agent span.
+`instrumentOpenAIAgents()` accepts either an agent or a runner. Multi-agent runs with handoffs automatically propagate a single trace across all agents — all spans share the same `traceId`. Handoff detection records `handoff.target_agent` on the `transfer_to_*` tool span; when instrumenting an agent directly, the agent's own span also aggregates the handoff targets.
 
 ```typescript
 import { instrumentOpenAIAgents } from '@tracelyx/core';

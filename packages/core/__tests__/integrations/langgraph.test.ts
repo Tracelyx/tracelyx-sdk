@@ -207,6 +207,31 @@ describe('instrumentLangGraph', () => {
     expect(lgSpan.tenantId).toBe('tenant-lg');
   });
 
+  it('nested instrumented subgraph invoke becomes a child span of parent invoke', async () => {
+    const subgraph: any = { invoke: vi.fn().mockResolvedValue({ sub: 'done' }) };
+    instrumentLangGraph(subgraph, client);
+
+    const parent: any = {
+      invoke: vi.fn().mockImplementation(async () => {
+        // węzeł grafu rodzica wywołuje subgraf
+        return subgraph.invoke({ nested: true });
+      }),
+    };
+    instrumentLangGraph(parent, client);
+
+    await parent.invoke({ input: 'top' });
+    await client.flush();
+
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body) as TracePayload;
+    expect(body.spans).toHaveLength(2);
+
+    const spans = [...body.spans].sort((a, b) => (a.parentSpanId === null ? -1 : 1));
+    const [parentSpan, childSpan] = spans;
+    expect(parentSpan.parentSpanId).toBeNull();
+    expect(childSpan.parentSpanId).toBe(parentSpan.id);
+    expect(childSpan.traceId).toBe(parentSpan.traceId);
+  });
+
   it('node spans carry langgraph.node_name and langgraph.thread_id from config', async () => {
     async function* fakeStream() {
       yield { researcher: { results: ['a'] } };

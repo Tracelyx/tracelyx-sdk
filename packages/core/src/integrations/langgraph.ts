@@ -16,6 +16,13 @@ interface LangGraphConfig {
   [key: string]: unknown;
 }
 
+interface StreamEventLike {
+  event?: string;
+  name?: string;
+  run_id?: string;
+  metadata?: { langgraph_node?: string; [key: string]: unknown };
+}
+
 interface CompiledGraphLike {
   invoke(input: unknown, config?: LangGraphConfig): Promise<unknown>;
   stream?(input: unknown, config?: LangGraphConfig): AsyncIterable<unknown>;
@@ -82,6 +89,58 @@ export function instrumentLangGraph<T extends CompiledGraphLike>(
 
         yield chunk;
         prevTime = now;
+      }
+    };
+  }
+
+  // Patch streamEvents() to create node spans with accurate start/end times paired by run_id.
+  if (typeof graphAsAny.streamEvents === 'function') {
+    const originalStreamEvents = graphAsAny.streamEvents.bind(graphAsAny);
+
+    graphAsAny.streamEvents = async function* (
+      input: unknown,
+      options?: LangGraphConfig,
+      ...rest: unknown[]
+    ): AsyncGenerator<unknown> {
+      const ctx = getActiveContext();
+      const traceId = ctx?.traceId ?? randomUUID();
+      const parentSpanId = ctx?.spanId ?? null;
+      const openNodes = new Map<string, { name: string; startTime: number }>();
+
+      for await (const event of originalStreamEvents(input, options, ...rest)) {
+        const e = event as StreamEventLike;
+        const nodeName = e.metadata?.langgraph_node;
+
+        if (nodeName !== undefined && e.run_id !== undefined) {
+          if (e.event === 'on_chain_start' && e.name === nodeName) {
+            openNodes.set(e.run_id, { name: nodeName, startTime: Date.now() });
+          } else if (e.event === 'on_chain_end' && openNodes.has(e.run_id)) {
+            const { name, startTime } = openNodes.get(e.run_id)!;
+            openNodes.delete(e.run_id);
+            const now = Date.now();
+            tracelyxClient.recordSpan({
+              id: randomUUID(),
+              traceId,
+              parentSpanId,
+              name: `langgraph.node.${name}`,
+              kind: 'agent_step',
+              startTime,
+              endTime: now,
+              durationMs: now - startTime,
+              status: 'ok',
+              attributes: {
+                'langgraph.node': name,
+                'langgraph.node_name': name,
+                ...(options?.configurable?.thread_id !== undefined && {
+                  'langgraph.thread_id': options.configurable.thread_id,
+                }),
+              },
+              tenantId: ctx?.tenantId,
+            });
+          }
+        }
+
+        yield event;
       }
     };
   }

@@ -376,6 +376,7 @@ describe('validate command', () => {
     const getCalls = fetchMock.mock.calls.filter(([, init]) => init?.method !== 'POST');
     expect(getCalls.length).toBeGreaterThanOrEqual(1);
     expect(String(getCalls[0][0])).toMatch(/\/v1\/traces\/[0-9a-f-]+$/);
+    expect(getCalls[0][1]?.signal).toBeInstanceOf(AbortSignal);
     expect(stdoutLines.join('')).toContain('✓ Tracelyx configured correctly');
   });
 

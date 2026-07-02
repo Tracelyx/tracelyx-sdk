@@ -78,7 +78,47 @@ function wrapTools(tools: ToolLike[], tracelyxClient: TracelyxClient, handoffTar
   }
 }
 
-export function instrumentOpenAIAgents<T extends AgentLike>(
+interface RunnerLike {
+  run(agent: unknown, ...args: unknown[]): Promise<unknown>;
+  [key: string | symbol]: unknown;
+}
+
+function isRunnerLike(value: AgentLike | RunnerLike): value is RunnerLike {
+  return (
+    typeof value.run === 'function' &&
+    (value as AgentLike).name === undefined &&
+    (value as AgentLike).tools === undefined &&
+    (value as AgentLike).handoffs === undefined
+  );
+}
+
+function instrumentHandoffTargets(handoffs: unknown[], tracelyxClient: TracelyxClient): void {
+  for (const handoff of handoffs) {
+    const target =
+      handoff !== null && typeof handoff === 'object' && 'agent' in (handoff as object)
+        ? (handoff as { agent: unknown }).agent
+        : handoff;
+    if (
+      target !== null &&
+      typeof target === 'object' &&
+      typeof (target as AgentLike).run === 'function'
+    ) {
+      instrumentAgent(target as AgentLike, tracelyxClient);
+    }
+  }
+}
+
+export function instrumentOpenAIAgents<T extends AgentLike | RunnerLike>(
+  agentOrRunner: T,
+  tracelyxClient: TracelyxClient,
+): T {
+  if (isRunnerLike(agentOrRunner)) {
+    return instrumentRunner(agentOrRunner, tracelyxClient) as T;
+  }
+  return instrumentAgent(agentOrRunner as AgentLike, tracelyxClient) as T;
+}
+
+function instrumentAgent<T extends AgentLike>(
   agent: T,
   tracelyxClient: TracelyxClient,
 ): T {
@@ -96,19 +136,7 @@ export function instrumentOpenAIAgents<T extends AgentLike>(
   }
 
   if (Array.isArray(agentAsAny.handoffs)) {
-    for (const handoff of agentAsAny.handoffs) {
-      const target =
-        handoff !== null && typeof handoff === 'object' && 'agent' in (handoff as object)
-          ? (handoff as { agent: unknown }).agent
-          : handoff;
-      if (
-        target !== null &&
-        typeof target === 'object' &&
-        typeof (target as AgentLike).run === 'function'
-      ) {
-        instrumentOpenAIAgents(target as AgentLike, tracelyxClient);
-      }
-    }
+    instrumentHandoffTargets(agentAsAny.handoffs, tracelyxClient);
   }
 
   agentAsAny.run = async function (...args: unknown[]): Promise<unknown> {
@@ -159,4 +187,68 @@ export function instrumentOpenAIAgents<T extends AgentLike>(
   };
 
   return agent;
+}
+
+function instrumentRunner<T extends RunnerLike>(runner: T, tracelyxClient: TracelyxClient): T {
+  const runnerAsAny = runner as any;
+  if (runnerAsAny[INSTRUMENTED]) return runner;
+  // Mark before wrapping so a runner instrumented twice does not double-wrap.
+  runnerAsAny[INSTRUMENTED] = true;
+
+  const originalRun = runnerAsAny.run.bind(runnerAsAny);
+
+  runnerAsAny.run = async function (agentArg: unknown, ...args: unknown[]): Promise<unknown> {
+    const agent = (agentArg ?? {}) as AgentLike;
+    // Instrument the agent's tools/handoffs, but NOT agent.run (the runner never calls it).
+    if (agent !== null && typeof agent === 'object') {
+      const handoffTargets = new Set<string>();
+      if (Array.isArray(agent.tools)) wrapTools(agent.tools, tracelyxClient, handoffTargets);
+      if (Array.isArray(agent.handoffs)) instrumentHandoffTargets(agent.handoffs, tracelyxClient);
+    }
+
+    const ctx = getActiveContext();
+    const spanId = randomUUID();
+    const traceId = ctx?.traceId ?? randomUUID();
+    const parentSpanId = ctx?.spanId ?? null;
+    const startTime = Date.now();
+    const agentName = agent.name ?? 'unknown';
+
+    const attributes: Record<string, unknown> = {
+      'agent.name': agentName,
+      ...(agent.model !== undefined && { 'openai.model': agent.model }),
+    };
+
+    let status: 'ok' | 'error' = 'ok';
+
+    try {
+      return await runWithContext({ spanId, traceId, tenantId: ctx?.tenantId }, () =>
+        originalRun(agentArg, ...args),
+      );
+    } catch (error) {
+      status = 'error';
+      attributes['error.type'] = classifyError(error);
+      if (error instanceof Error) {
+        attributes['error.message'] = error.message;
+        attributes['error.stack'] = error.stack;
+      }
+      throw error;
+    } finally {
+      const endTime = Date.now();
+      tracelyxClient.recordSpan({
+        id: spanId,
+        traceId,
+        parentSpanId,
+        name: `agent.${agentName}`,
+        kind: 'agent_step',
+        startTime,
+        endTime,
+        durationMs: endTime - startTime,
+        status,
+        attributes,
+        tenantId: ctx?.tenantId,
+      });
+    }
+  };
+
+  return runner;
 }

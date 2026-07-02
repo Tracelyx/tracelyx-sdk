@@ -314,4 +314,56 @@ describe('instrumentOpenAIAgents', () => {
     const body = JSON.parse(fetchMock.mock.calls[0][1].body) as TracePayload;
     expect(body.spans.map((s: any) => s.name).sort()).toEqual(['agent.a', 'agent.b']);
   });
+
+  it('instruments a Runner: creates agent_step span named after the passed agent', async () => {
+    const agent: any = { name: 'assistant', model: 'gpt-4o', tools: [] };
+    const runner: any = {
+      run: vi.fn().mockResolvedValue({ finalOutput: 'done' }),
+    };
+    instrumentOpenAIAgents(runner, client);
+
+    const result = await runner.run(agent, 'user input');
+    expect(result).toEqual({ finalOutput: 'done' });
+    await client.flush();
+
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body) as TracePayload;
+    const span = body.spans[0];
+    expect(span.name).toBe('agent.assistant');
+    expect(span.kind).toBe('agent_step');
+    expect(span.attributes['agent.name']).toBe('assistant');
+    expect(span.attributes['openai.model']).toBe('gpt-4o');
+  });
+
+  it('Runner patch instruments the passed agent tools (tool spans are children of run span)', async () => {
+    const tool: any = { name: 'search', on_invoke_tool: vi.fn().mockResolvedValue('found') };
+    const agent: any = { name: 'assistant', tools: [tool] };
+    const runner: any = {
+      run: vi.fn().mockImplementation(async (a: any) => a.tools[0].on_invoke_tool({}, '{"q":"x"}')),
+    };
+    instrumentOpenAIAgents(runner, client);
+
+    await runner.run(agent, 'input');
+    await client.flush();
+
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body) as TracePayload;
+    const runSpan = body.spans.find((s) => s.kind === 'agent_step')!;
+    const toolSpan = body.spans.find((s) => s.kind === 'tool_call')!;
+    expect(toolSpan.parentSpanId).toBe(runSpan.id);
+    expect(toolSpan.traceId).toBe(runSpan.traceId);
+  });
+
+  it('runner instrumentation is idempotent and records errors with error.type', async () => {
+    const agent: any = { name: 'assistant' };
+    const runner: any = { run: vi.fn().mockRejectedValue(new Error('rate limit exceeded')) };
+    instrumentOpenAIAgents(runner, client);
+    instrumentOpenAIAgents(runner, client);
+
+    await expect(runner.run(agent, 'x')).rejects.toThrow('rate limit');
+    await client.flush();
+
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body) as TracePayload;
+    expect(body.spans).toHaveLength(1);
+    expect(body.spans[0].status).toBe('error');
+    expect(body.spans[0].attributes['error.type']).toBe('rate_limit');
+  });
 });

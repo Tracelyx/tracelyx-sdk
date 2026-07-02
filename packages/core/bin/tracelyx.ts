@@ -194,37 +194,45 @@ export async function runValidateCommand(args: string[]): Promise<void> {
     return;
   }
 
-  clearTimeout(timer);
-
   if (response.status === 401) {
+    clearTimeout(timer);
     out({ ok: false, error: 'ERROR: API key is invalid or expired. Get a new key at https://app.tracelyx.dev' });
     process.exit(1);
     return;
   }
   if (!response.ok) {
+    clearTimeout(timer);
     out({ ok: false, error: `ERROR: Server returned ${response.status}.` });
     process.exit(1);
     return;
   }
 
   // Receipt confirmation: poll GET /v1/traces/:id until the trace is queryable.
+  // The AbortController created before the POST is the single command-wide 10 s
+  // deadline; its signal also bounds every GET attempt below.
   const retryDelayMs = parseInt(process.env['TRACELYX_VALIDATE_RETRY_DELAY_MS'] ?? '1000', 10);
   let received: Record<string, unknown> | null = null;
 
-  for (let attempt = 0; attempt < 5; attempt++) {
-    if (attempt > 0) await new Promise((resolve) => setTimeout(resolve, retryDelayMs));
+  for (let attempt = 0; attempt < 5 && !controller.signal.aborted; attempt++) {
+    if (attempt > 0) {
+      await new Promise((resolve) => setTimeout(resolve, retryDelayMs));
+      if (controller.signal.aborted) break;
+    }
     try {
       const getResponse = await fetch(`${endpoint}/v1/traces/${testTraceId}`, {
         headers: { Authorization: `Bearer ${apiKey}` },
+        signal: controller.signal,
       });
       if (getResponse.ok) {
         received = (await getResponse.json()) as Record<string, unknown>;
         break;
       }
     } catch {
-      // transient network error — retry
+      // transient network error — retry (or deadline fired; loop guard exits)
     }
   }
+
+  clearTimeout(timer);
 
   if (received === null) {
     out({

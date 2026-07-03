@@ -57,6 +57,7 @@ export class Span {
     this.status = 'error';
     this.attrs['error.message'] = error.message;
     this.attrs['error.stack'] = error.stack ?? '';
+    this.attrs['error.type'] = error.name;
   }
 
   end(attributes?: Record<string, unknown>, options?: { stateSnapshot?: string }): void {

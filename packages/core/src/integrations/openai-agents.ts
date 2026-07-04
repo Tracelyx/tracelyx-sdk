@@ -22,7 +22,7 @@ interface AgentLike {
   [key: string | symbol]: unknown;
 }
 
-function wrapTools(tools: ToolLike[], tracelyxClient: TracelyxClient, handoffTargets: Set<string>): void {
+function wrapTools(tools: ToolLike[], tracelyxClient: TracelyxClient): void {
   for (const tool of tools) {
     if (tool[TOOL_INSTRUMENTED]) continue;
     if (typeof tool.on_invoke_tool !== 'function') continue;
@@ -48,13 +48,16 @@ function wrapTools(tools: ToolLike[], tracelyxClient: TracelyxClient, handoffTar
         if (error instanceof Error) {
           attributes['error.message'] = error.message;
           attributes['error.stack'] = error.stack;
+          attributes['error.name'] = error.name;
         }
         throw error;
       } finally {
         const endTime = Date.now();
         if (toolName.startsWith('transfer_to_')) {
           const target = toolName.slice('transfer_to_'.length);
-          handoffTargets.add(target);
+          // Attribute to the currently-running agent/runner span (per-run Set),
+          // not a Set shared across concurrent runs of the same instance.
+          getActiveContext()?.handoffTargets?.add(target);
           attributes['handoff.target_agent'] = target;
         }
         const toolSpan: SpanPayload = {
@@ -129,10 +132,9 @@ function instrumentAgent<T extends AgentLike>(
 
   const originalRun = agentAsAny.run.bind(agentAsAny);
   const agentName = agentAsAny.name ?? 'unknown';
-  const handoffTargets = new Set<string>();
 
   if (Array.isArray(agentAsAny.tools)) {
-    wrapTools(agentAsAny.tools as ToolLike[], tracelyxClient, handoffTargets);
+    wrapTools(agentAsAny.tools as ToolLike[], tracelyxClient);
   }
 
   if (Array.isArray(agentAsAny.handoffs)) {
@@ -145,6 +147,8 @@ function instrumentAgent<T extends AgentLike>(
     const traceId = ctx?.traceId ?? randomUUID();
     const parentSpanId = ctx?.spanId ?? null;
     const startTime = Date.now();
+    // Fresh per-run collector — tools attribute their handoff into this via context.
+    const handoffTargets = new Set<string>();
 
     const attributes: Record<string, unknown> = {
       'agent.name': agentName,
@@ -154,19 +158,22 @@ function instrumentAgent<T extends AgentLike>(
     let status: 'ok' | 'error' = 'ok';
 
     try {
-      return await runWithContext({ spanId, traceId, tenantId: ctx?.tenantId }, () => originalRun(...args));
+      return await runWithContext(
+        { spanId, traceId, tenantId: ctx?.tenantId, handoffTargets },
+        () => originalRun(...args),
+      );
     } catch (error) {
       status = 'error';
       attributes['error.type'] = classifyError(error);
       if (error instanceof Error) {
         attributes['error.message'] = error.message;
         attributes['error.stack'] = error.stack;
+        attributes['error.name'] = error.name;
       }
       throw error;
     } finally {
       if (handoffTargets.size > 0) {
         attributes['handoff.target_agent'] = [...handoffTargets].join(',');
-        handoffTargets.clear();
       }
       const endTime = Date.now();
       const span: SpanPayload = {
@@ -201,8 +208,7 @@ function instrumentRunner<T extends RunnerLike>(runner: T, tracelyxClient: Trace
     const agent = (agentArg ?? {}) as AgentLike;
     // Instrument the agent's tools/handoffs, but NOT agent.run (the runner never calls it).
     if (agent !== null && typeof agent === 'object') {
-      const handoffTargets = new Set<string>();
-      if (Array.isArray(agent.tools)) wrapTools(agent.tools, tracelyxClient, handoffTargets);
+      if (Array.isArray(agent.tools)) wrapTools(agent.tools, tracelyxClient);
       if (Array.isArray(agent.handoffs)) instrumentHandoffTargets(agent.handoffs, tracelyxClient);
     }
 
@@ -212,6 +218,7 @@ function instrumentRunner<T extends RunnerLike>(runner: T, tracelyxClient: Trace
     const parentSpanId = ctx?.spanId ?? null;
     const startTime = Date.now();
     const agentName = agent.name ?? 'unknown';
+    const handoffTargets = new Set<string>();
 
     const attributes: Record<string, unknown> = {
       'agent.name': agentName,
@@ -221,8 +228,9 @@ function instrumentRunner<T extends RunnerLike>(runner: T, tracelyxClient: Trace
     let status: 'ok' | 'error' = 'ok';
 
     try {
-      return await runWithContext({ spanId, traceId, tenantId: ctx?.tenantId }, () =>
-        originalRun(agentArg, ...args),
+      return await runWithContext(
+        { spanId, traceId, tenantId: ctx?.tenantId, handoffTargets },
+        () => originalRun(agentArg, ...args),
       );
     } catch (error) {
       status = 'error';
@@ -230,9 +238,13 @@ function instrumentRunner<T extends RunnerLike>(runner: T, tracelyxClient: Trace
       if (error instanceof Error) {
         attributes['error.message'] = error.message;
         attributes['error.stack'] = error.stack;
+        attributes['error.name'] = error.name;
       }
       throw error;
     } finally {
+      if (handoffTargets.size > 0) {
+        attributes['handoff.target_agent'] = [...handoffTargets].join(',');
+      }
       const endTime = Date.now();
       tracelyxClient.recordSpan({
         id: spanId,

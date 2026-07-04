@@ -55,6 +55,7 @@ describe('instrumentOpenAIAgents', () => {
     const body = JSON.parse(fetchMock.mock.calls[0][1].body) as TracePayload;
     expect(body.spans[0].status).toBe('error');
     expect(body.spans[0].attributes['error.message']).toBe('agent failed');
+    expect(body.spans[0].attributes['error.name']).toBe('Error');
   });
 
   it('sets error.type attribute when run() throws', async () => {
@@ -179,6 +180,7 @@ describe('instrumentOpenAIAgents', () => {
 
     expect(toolSpan.status).toBe('error');
     expect(toolSpan.attributes['error.message']).toBe('tool exploded');
+    expect(toolSpan.attributes['error.name']).toBe('Error');
   });
 
   it('links to parent trace via AsyncLocalStorage', async () => {
@@ -313,6 +315,46 @@ describe('instrumentOpenAIAgents', () => {
 
     const body = JSON.parse(fetchMock.mock.calls[0][1].body) as TracePayload;
     expect(body.spans.map((s: any) => s.name).sort()).toEqual(['agent.a', 'agent.b']);
+  });
+
+  it('keeps handoff.target_agent per-run under concurrent runs of the same agent instance', async () => {
+    // Run A hands off to billing then parks; run B hands off to refunds and finishes
+    // while A is still in flight. Each run's agent_step must carry ONLY its own target.
+    let releaseA: () => void = () => {};
+    const aHolding = new Promise<void>((r) => {
+      releaseA = r;
+    });
+    const agent: any = {
+      name: 'triage',
+      tools: [
+        { name: 'transfer_to_billing', on_invoke_tool: vi.fn().mockResolvedValue(null) },
+        { name: 'transfer_to_refunds', on_invoke_tool: vi.fn().mockResolvedValue(null) },
+      ],
+      run: vi.fn().mockImplementation(async (which: string) => {
+        if (which === 'A') {
+          await agent.tools[0].on_invoke_tool({}, '{}'); // billing
+          await aHolding;
+          return 'A';
+        }
+        await agent.tools[1].on_invoke_tool({}, '{}'); // refunds
+        return 'B';
+      }),
+    };
+    instrumentOpenAIAgents(agent, client);
+
+    const pA = agent.run('A'); // records billing, then parks at the barrier
+    await new Promise((r) => setTimeout(r, 0)); // let A reach the barrier
+    await agent.run('B'); // records refunds and completes while A holds
+    releaseA();
+    await pA;
+    await client.flush();
+
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body) as TracePayload;
+    const targets = body.spans
+      .filter((s) => s.kind === 'agent_step')
+      .map((s) => s.attributes['handoff.target_agent'])
+      .sort();
+    expect(targets).toEqual(['billing', 'refunds']);
   });
 
   it('instruments a Runner: creates agent_step span named after the passed agent', async () => {

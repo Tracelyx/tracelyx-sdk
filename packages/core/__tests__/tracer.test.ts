@@ -49,6 +49,19 @@ describe('Span', () => {
     expect(spans[0].status).toBe('error');
     expect(spans[0].attributes['error.type']).toBe('rate_limit');
   });
+
+  it('recordError captures the raw exception class in error.name, keeping classified error.type', () => {
+    const captured: SpanPayload[] = [];
+    const span = new Span('step', 'custom', 'trace-1', null, (p) => captured.push(p));
+
+    // TypeError classifies to 'unknown' — error.name preserves the class that
+    // classifyError() collapses away, useful for debugging.
+    span.recordError(new TypeError('bad type'));
+    span.end();
+
+    expect(captured[0].attributes['error.name']).toBe('TypeError');
+    expect(captured[0].attributes['error.type']).toBe('unknown');
+  });
 });
 
 describe('Trace', () => {

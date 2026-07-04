@@ -7,6 +7,10 @@ import type { SpanPayload } from '../src/types.js';
 // ── Shared helpers ─────────────────────────────────────────────────────────
 
 function flagValue(args: string[], flag: string): string | undefined {
+  // Support both space-separated (`--flag value`) and equals (`--flag=value`) forms.
+  const eq = `${flag}=`;
+  const inline = args.find((a) => a.startsWith(eq));
+  if (inline !== undefined) return inline.slice(eq.length);
   const idx = args.indexOf(flag);
   return idx >= 0 ? args[idx + 1] : undefined;
 }

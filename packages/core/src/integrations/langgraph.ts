@@ -47,6 +47,13 @@ export function instrumentLangGraph<T extends CompiledGraphLike>(
   // Patch stream() to create one child span per node update chunk.
   // Reads getActiveContext() at iteration time so it picks up whichever span
   // is active in AsyncLocalStorage — including the invoke span set below.
+  //
+  // Per-node spans are only derivable from streamMode 'updates', where each
+  // chunk is shaped `{ nodeName: partialState }`. Under LangGraph's default
+  // 'values' mode a chunk is the full state keyed by channels, so treating
+  // every key as a node would emit bogus per-channel spans — we skip emission
+  // (and pass chunks through untouched) unless 'updates' is explicitly set.
+  // For reliable per-node timing regardless of mode, use streamEvents() below.
   if (typeof graphAsAny.stream === 'function') {
     const originalStream = graphAsAny.stream.bind(graphAsAny);
 
@@ -54,6 +61,7 @@ export function instrumentLangGraph<T extends CompiledGraphLike>(
       input: unknown,
       config?: LangGraphConfig,
     ): AsyncGenerator<unknown> {
+      const emitNodeSpans = config?.streamMode === 'updates';
       const ctx = getActiveContext();
       const streamTraceId = ctx?.traceId ?? randomUUID();
       const streamParentSpanId = ctx?.spanId ?? null;
@@ -62,7 +70,7 @@ export function instrumentLangGraph<T extends CompiledGraphLike>(
       for await (const chunk of originalStream(input, config)) {
         const now = Date.now();
 
-        if (chunk !== null && typeof chunk === 'object') {
+        if (emitNodeSpans && chunk !== null && typeof chunk === 'object') {
           for (const [nodeName] of Object.entries(chunk as Record<string, unknown>)) {
             const nodeSpan: SpanPayload = {
               id: randomUUID(),
@@ -162,13 +170,16 @@ export function instrumentLangGraph<T extends CompiledGraphLike>(
     let status: 'ok' | 'error' = 'ok';
 
     try {
-      return await runWithContext({ spanId, traceId }, () => originalInvoke(input, config));
+      return await runWithContext({ spanId, traceId, tenantId: ctx?.tenantId }, () =>
+        originalInvoke(input, config),
+      );
     } catch (error) {
       status = 'error';
       attributes['error.type'] = classifyError(error);
       if (error instanceof Error) {
         attributes['error.message'] = error.message;
         attributes['error.stack'] = error.stack;
+        attributes['error.name'] = error.name;
       }
       throw error;
     } finally {

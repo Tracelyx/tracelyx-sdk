@@ -55,6 +55,19 @@ describe('instrumentOpenAIAgents', () => {
     const body = JSON.parse(fetchMock.mock.calls[0][1].body) as TracePayload;
     expect(body.spans[0].status).toBe('error');
     expect(body.spans[0].attributes['error.message']).toBe('agent failed');
+    expect(body.spans[0].attributes['error.name']).toBe('Error');
+  });
+
+  it('sets error.type attribute when run() throws', async () => {
+    const agent = { name: 'helper', run: vi.fn().mockRejectedValue(new Error('fetch failed')) };
+    instrumentOpenAIAgents(agent, client);
+
+    await expect(agent.run('input')).rejects.toThrow('fetch failed');
+    await client.flush();
+
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body) as TracePayload;
+    const agentSpan = body.spans.find((s) => s.kind === 'agent_step')!;
+    expect(agentSpan.attributes['error.type']).toBe('network_error');
   });
 
   it('is idempotent — second call does not double-wrap', async () => {
@@ -167,6 +180,7 @@ describe('instrumentOpenAIAgents', () => {
 
     expect(toolSpan.status).toBe('error');
     expect(toolSpan.attributes['error.message']).toBe('tool exploded');
+    expect(toolSpan.attributes['error.name']).toBe('Error');
   });
 
   it('links to parent trace via AsyncLocalStorage', async () => {
@@ -228,5 +242,170 @@ describe('instrumentOpenAIAgents', () => {
     const body = JSON.parse(fetchMock.mock.calls[0][1].body) as TracePayload;
     const toolSpan = body.spans.find((s) => s.name === 'tool.do_thing')!;
     expect(toolSpan.tenantId).toBe('tenant-abc');
+  });
+
+  it('auto-instruments handoff target agents so trace propagates through handoffs', async () => {
+    const billingAgent: any = {
+      name: 'billing',
+      run: vi.fn().mockResolvedValue('billing done'),
+    };
+    const triageAgent: any = {
+      name: 'triage',
+      handoffs: [billingAgent],
+      run: vi.fn().mockImplementation(async () => billingAgent.run('handed off')),
+    };
+    instrumentOpenAIAgents(triageAgent, client);
+
+    await triageAgent.run('help me with my invoice');
+    await client.flush();
+
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body) as TracePayload;
+    const triageSpan = body.spans.find((s) => s.name === 'agent.triage')!;
+    const billingSpan = body.spans.find((s) => s.name === 'agent.billing')!;
+    expect(billingSpan.traceId).toBe(triageSpan.traceId);
+    expect(billingSpan.parentSpanId).toBe(triageSpan.id);
+  });
+
+  it('supports handoff objects wrapping the agent ({ agent } shape)', async () => {
+    const target: any = { name: 'refunds', run: vi.fn().mockResolvedValue('ok') };
+    const source: any = {
+      name: 'support',
+      handoffs: [{ agent: target, toolName: 'transfer_to_refunds' }],
+      run: vi.fn().mockResolvedValue('ok'),
+    };
+    instrumentOpenAIAgents(source, client);
+
+    await target.run('direct call after handoff');
+    await client.flush();
+
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body) as TracePayload;
+    expect(body.spans.some((s) => s.name === 'agent.refunds')).toBe(true);
+  });
+
+  it('sets handoff.target_agent attribute on the transfer_to_ tool span', async () => {
+    const transferTool: any = {
+      name: 'transfer_to_billing',
+      on_invoke_tool: vi.fn().mockResolvedValue('transferred'),
+    };
+    const agent: any = {
+      name: 'triage',
+      tools: [transferTool],
+      run: vi.fn().mockImplementation(async () => transferTool.on_invoke_tool({}, '{}')),
+    };
+    instrumentOpenAIAgents(agent, client);
+
+    await agent.run('input');
+    await client.flush();
+
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body) as TracePayload;
+    const toolSpan = body.spans.find((s) => s.kind === 'tool_call')!;
+    expect(toolSpan.attributes['handoff.target_agent']).toBe('billing');
+  });
+
+  it('does not infinitely recurse on mutual handoff cycles (A <-> B)', async () => {
+    const agentA: any = { name: 'a', handoffs: [] as any[], run: vi.fn().mockResolvedValue('ok') };
+    const agentB: any = { name: 'b', handoffs: [agentA], run: vi.fn().mockResolvedValue('ok') };
+    agentA.handoffs.push(agentB);
+
+    expect(() => instrumentOpenAIAgents(agentA, client)).not.toThrow();
+
+    await agentA.run('x');
+    await agentB.run('y');
+    await client.flush();
+
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body) as TracePayload;
+    expect(body.spans.map((s: any) => s.name).sort()).toEqual(['agent.a', 'agent.b']);
+  });
+
+  it('keeps handoff.target_agent per-run under concurrent runs of the same agent instance', async () => {
+    // Run A hands off to billing then parks; run B hands off to refunds and finishes
+    // while A is still in flight. Each run's agent_step must carry ONLY its own target.
+    let releaseA: () => void = () => {};
+    const aHolding = new Promise<void>((r) => {
+      releaseA = r;
+    });
+    const agent: any = {
+      name: 'triage',
+      tools: [
+        { name: 'transfer_to_billing', on_invoke_tool: vi.fn().mockResolvedValue(null) },
+        { name: 'transfer_to_refunds', on_invoke_tool: vi.fn().mockResolvedValue(null) },
+      ],
+      run: vi.fn().mockImplementation(async (which: string) => {
+        if (which === 'A') {
+          await agent.tools[0].on_invoke_tool({}, '{}'); // billing
+          await aHolding;
+          return 'A';
+        }
+        await agent.tools[1].on_invoke_tool({}, '{}'); // refunds
+        return 'B';
+      }),
+    };
+    instrumentOpenAIAgents(agent, client);
+
+    const pA = agent.run('A'); // records billing, then parks at the barrier
+    await new Promise((r) => setTimeout(r, 0)); // let A reach the barrier
+    await agent.run('B'); // records refunds and completes while A holds
+    releaseA();
+    await pA;
+    await client.flush();
+
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body) as TracePayload;
+    const targets = body.spans
+      .filter((s) => s.kind === 'agent_step')
+      .map((s) => s.attributes['handoff.target_agent'])
+      .sort();
+    expect(targets).toEqual(['billing', 'refunds']);
+  });
+
+  it('instruments a Runner: creates agent_step span named after the passed agent', async () => {
+    const agent: any = { name: 'assistant', model: 'gpt-4o', tools: [] };
+    const runner: any = {
+      run: vi.fn().mockResolvedValue({ finalOutput: 'done' }),
+    };
+    instrumentOpenAIAgents(runner, client);
+
+    const result = await runner.run(agent, 'user input');
+    expect(result).toEqual({ finalOutput: 'done' });
+    await client.flush();
+
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body) as TracePayload;
+    const span = body.spans[0];
+    expect(span.name).toBe('agent.assistant');
+    expect(span.kind).toBe('agent_step');
+    expect(span.attributes['agent.name']).toBe('assistant');
+    expect(span.attributes['openai.model']).toBe('gpt-4o');
+  });
+
+  it('Runner patch instruments the passed agent tools (tool spans are children of run span)', async () => {
+    const tool: any = { name: 'search', on_invoke_tool: vi.fn().mockResolvedValue('found') };
+    const agent: any = { name: 'assistant', tools: [tool] };
+    const runner: any = {
+      run: vi.fn().mockImplementation(async (a: any) => a.tools[0].on_invoke_tool({}, '{"q":"x"}')),
+    };
+    instrumentOpenAIAgents(runner, client);
+
+    await runner.run(agent, 'input');
+    await client.flush();
+
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body) as TracePayload;
+    const runSpan = body.spans.find((s) => s.kind === 'agent_step')!;
+    const toolSpan = body.spans.find((s) => s.kind === 'tool_call')!;
+    expect(toolSpan.parentSpanId).toBe(runSpan.id);
+    expect(toolSpan.traceId).toBe(runSpan.traceId);
+  });
+
+  it('runner instrumentation is idempotent and records errors with error.type', async () => {
+    const agent: any = { name: 'assistant' };
+    const runner: any = { run: vi.fn().mockRejectedValue(new Error('rate limit exceeded')) };
+    instrumentOpenAIAgents(runner, client);
+    instrumentOpenAIAgents(runner, client);
+
+    await expect(runner.run(agent, 'x')).rejects.toThrow('rate limit');
+    await client.flush();
+
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body) as TracePayload;
+    expect(body.spans).toHaveLength(1);
+    expect(body.spans[0].status).toBe('error');
+    expect(body.spans[0].attributes['error.type']).toBe('rate_limit');
   });
 });

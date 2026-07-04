@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from 'crypto';
 import { getActiveContext } from '../tracer.js';
+import { classifyError } from '../errors.js';
 import type { TracelyxClient } from '../client.js';
 import type { SpanPayload } from '../types.js';
 
@@ -101,9 +102,11 @@ export function instrumentAnthropic<T extends AnthropicLike>(
       return response;
     } catch (error) {
       status = 'error';
+      attributes['error.type'] = classifyError(error);
       if (error instanceof Error) {
         attributes['error.message'] = error.message;
         attributes['error.stack'] = error.stack;
+        attributes['error.name'] = error.name;
       }
       throw error;
     } finally {

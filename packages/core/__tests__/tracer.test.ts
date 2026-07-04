@@ -37,6 +37,31 @@ describe('Span', () => {
     expect(captured[0].attributes['error.message']).toBe('something broke');
     expect(typeof captured[0].attributes['error.stack']).toBe('string');
   });
+
+  it('recordError sets error.type attribute from classifyError', async () => {
+    const spans: SpanPayload[] = [];
+    const trace = new Trace((p) => spans.push(p));
+    const span = trace.startSpan('failing-step', 'tool_call');
+
+    span.recordError(Object.assign(new Error('Request failed'), { status: 429 }));
+    span.end();
+
+    expect(spans[0].status).toBe('error');
+    expect(spans[0].attributes['error.type']).toBe('rate_limit');
+  });
+
+  it('recordError captures the raw exception class in error.name, keeping classified error.type', () => {
+    const captured: SpanPayload[] = [];
+    const span = new Span('step', 'custom', 'trace-1', null, (p) => captured.push(p));
+
+    // TypeError classifies to 'unknown' — error.name preserves the class that
+    // classifyError() collapses away, useful for debugging.
+    span.recordError(new TypeError('bad type'));
+    span.end();
+
+    expect(captured[0].attributes['error.name']).toBe('TypeError');
+    expect(captured[0].attributes['error.type']).toBe('unknown');
+  });
 });
 
 describe('Trace', () => {
@@ -79,6 +104,19 @@ describe('Trace', () => {
 
     expect(captured[0].status).toBe('error');
     expect(captured[0].attributes['error.message']).toBe('boom');
+  });
+
+  it('trace.trace() sets error.type when wrapped fn throws', async () => {
+    const spans: SpanPayload[] = [];
+    const trace = new Trace((p) => spans.push(p));
+
+    await expect(
+      trace.trace('step', async () => {
+        throw new Error('Request timed out after 5000ms');
+      }),
+    ).rejects.toThrow('timed out');
+
+    expect(spans[0].attributes['error.type']).toBe('tool_timeout');
   });
 
   it('noop trace (null onSpan) calls fn but records no spans', async () => {

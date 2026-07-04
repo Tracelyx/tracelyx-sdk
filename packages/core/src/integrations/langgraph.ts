@@ -1,5 +1,6 @@
 import { randomUUID } from 'crypto';
 import { getActiveContext, runWithContext } from '../tracer.js';
+import { classifyError } from '../errors.js';
 import type { TracelyxClient } from '../client.js';
 import type { SpanPayload } from '../types.js';
 
@@ -13,6 +14,13 @@ interface LangGraphConfig {
   };
   streamMode?: string;
   [key: string]: unknown;
+}
+
+interface StreamEventLike {
+  event?: string;
+  name?: string;
+  run_id?: string;
+  metadata?: { langgraph_node?: string; [key: string]: unknown };
 }
 
 interface CompiledGraphLike {
@@ -39,6 +47,13 @@ export function instrumentLangGraph<T extends CompiledGraphLike>(
   // Patch stream() to create one child span per node update chunk.
   // Reads getActiveContext() at iteration time so it picks up whichever span
   // is active in AsyncLocalStorage — including the invoke span set below.
+  //
+  // Per-node spans are only derivable from streamMode 'updates', where each
+  // chunk is shaped `{ nodeName: partialState }`. Under LangGraph's default
+  // 'values' mode a chunk is the full state keyed by channels, so treating
+  // every key as a node would emit bogus per-channel spans — we skip emission
+  // (and pass chunks through untouched) unless 'updates' is explicitly set.
+  // For reliable per-node timing regardless of mode, use streamEvents() below.
   if (typeof graphAsAny.stream === 'function') {
     const originalStream = graphAsAny.stream.bind(graphAsAny);
 
@@ -46,6 +61,7 @@ export function instrumentLangGraph<T extends CompiledGraphLike>(
       input: unknown,
       config?: LangGraphConfig,
     ): AsyncGenerator<unknown> {
+      const emitNodeSpans = config?.streamMode === 'updates';
       const ctx = getActiveContext();
       const streamTraceId = ctx?.traceId ?? randomUUID();
       const streamParentSpanId = ctx?.spanId ?? null;
@@ -54,7 +70,7 @@ export function instrumentLangGraph<T extends CompiledGraphLike>(
       for await (const chunk of originalStream(input, config)) {
         const now = Date.now();
 
-        if (chunk !== null && typeof chunk === 'object') {
+        if (emitNodeSpans && chunk !== null && typeof chunk === 'object') {
           for (const [nodeName] of Object.entries(chunk as Record<string, unknown>)) {
             const nodeSpan: SpanPayload = {
               id: randomUUID(),
@@ -66,7 +82,13 @@ export function instrumentLangGraph<T extends CompiledGraphLike>(
               endTime: now,
               durationMs: now - prevTime,
               status: 'ok',
-              attributes: { 'langgraph.node': nodeName },
+              attributes: {
+                'langgraph.node': nodeName,
+                'langgraph.node_name': nodeName,
+                ...(config?.configurable?.thread_id !== undefined && {
+                  'langgraph.thread_id': config.configurable.thread_id,
+                }),
+              },
               tenantId: getActiveContext()?.tenantId,
             };
             tracelyxClient.recordSpan(nodeSpan);
@@ -75,6 +97,58 @@ export function instrumentLangGraph<T extends CompiledGraphLike>(
 
         yield chunk;
         prevTime = now;
+      }
+    };
+  }
+
+  // Patch streamEvents() to create node spans with accurate start/end times paired by run_id.
+  if (typeof graphAsAny.streamEvents === 'function') {
+    const originalStreamEvents = graphAsAny.streamEvents.bind(graphAsAny);
+
+    graphAsAny.streamEvents = async function* (
+      input: unknown,
+      options?: LangGraphConfig,
+      ...rest: unknown[]
+    ): AsyncGenerator<unknown> {
+      const ctx = getActiveContext();
+      const traceId = ctx?.traceId ?? randomUUID();
+      const parentSpanId = ctx?.spanId ?? null;
+      const openNodes = new Map<string, { name: string; startTime: number }>();
+
+      for await (const event of originalStreamEvents(input, options, ...rest)) {
+        const e = event as StreamEventLike;
+        const nodeName = e.metadata?.langgraph_node;
+
+        if (nodeName !== undefined && e.run_id !== undefined) {
+          if (e.event === 'on_chain_start' && e.name === nodeName) {
+            openNodes.set(e.run_id, { name: nodeName, startTime: Date.now() });
+          } else if (e.event === 'on_chain_end' && openNodes.has(e.run_id)) {
+            const { name, startTime } = openNodes.get(e.run_id)!;
+            openNodes.delete(e.run_id);
+            const now = Date.now();
+            tracelyxClient.recordSpan({
+              id: randomUUID(),
+              traceId,
+              parentSpanId,
+              name: `langgraph.node.${name}`,
+              kind: 'agent_step',
+              startTime,
+              endTime: now,
+              durationMs: now - startTime,
+              status: 'ok',
+              attributes: {
+                'langgraph.node': name,
+                'langgraph.node_name': name,
+                ...(options?.configurable?.thread_id !== undefined && {
+                  'langgraph.thread_id': options.configurable.thread_id,
+                }),
+              },
+              tenantId: ctx?.tenantId,
+            });
+          }
+        }
+
+        yield event;
       }
     };
   }
@@ -96,12 +170,16 @@ export function instrumentLangGraph<T extends CompiledGraphLike>(
     let status: 'ok' | 'error' = 'ok';
 
     try {
-      return await runWithContext({ spanId, traceId }, () => originalInvoke(input, config));
+      return await runWithContext({ spanId, traceId, tenantId: ctx?.tenantId }, () =>
+        originalInvoke(input, config),
+      );
     } catch (error) {
       status = 'error';
+      attributes['error.type'] = classifyError(error);
       if (error instanceof Error) {
         attributes['error.message'] = error.message;
         attributes['error.stack'] = error.stack;
+        attributes['error.name'] = error.name;
       }
       throw error;
     } finally {

@@ -38,14 +38,14 @@ describe('Span', () => {
     expect(typeof captured[0].attributes['error.stack']).toBe('string');
   });
 
-  it('records the error type (constructor name) on recordError', () => {
+  it('records the raw exception class in error.name on recordError', () => {
     const captured: SpanPayload[] = [];
     const span = new Span('step', 'custom', 'trace-1', null, (p) => captured.push(p));
 
     span.recordError(new TypeError('bad type'));
     span.end();
 
-    expect(captured[0].attributes['error.type']).toBe('TypeError');
+    expect(captured[0].attributes['error.name']).toBe('TypeError');
   });
 });
 

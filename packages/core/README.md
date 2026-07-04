@@ -43,7 +43,7 @@ await tracelyx.flush(); // call once at process exit
 
 ### Error classification
 
-Spans with status `error` automatically receive an `attributes['error.type']` field. The SDK classifies exceptions into: `tool_timeout`, `context_window_exceeded`, `json_parse_error`, `rate_limit`, `network_error`, `hook_error`, or `unknown`. The `classifyError()` function is exported publicly for custom error handling.
+Spans with status `error` automatically receive an `attributes['error.type']` field. The SDK classifies exceptions into: `tool_timeout`, `context_window_exceeded`, `json_parse_error`, `rate_limit`, `network_error`, `hook_error`, or `unknown`. The raw exception class is also preserved in `attributes['error.name']` (e.g. `TypeError`, `AbortError`) — useful when the classifier collapses to `unknown`. The `classifyError()` function is exported publicly for custom error handling.
 
 ```typescript
 import { classifyError } from '@tracelyx/core';
@@ -58,7 +58,7 @@ try {
 
 ### LangGraph
 
-LangGraph integration instruments both `stream()` and `streamEvents()` calls, creating per-node spans. `streamEvents()` gives accurate per-node start/end times (from `on_chain_start`/`on_chain_end` events; requires `@langchain/langgraph >= 0.2.0`), while `stream()` approximates node duration as the time between successive chunks.
+LangGraph integration instruments both `stream()` and `streamEvents()` calls, creating per-node spans. `streamEvents()` gives accurate per-node start/end times (from `on_chain_start`/`on_chain_end` events; requires `@langchain/langgraph >= 0.2.0`). The `stream()` path derives one span per node from update chunks and approximates node duration as the time between successive chunks — it requires `streamMode: 'updates'` (under the default `'values'` mode a chunk is the full state keyed by channels, not nodes, so no node spans are emitted). For per-node timing regardless of mode, prefer `streamEvents()`.
 
 Emitted attributes:
 - `langgraph.node_name` — the executed node

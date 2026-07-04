@@ -91,6 +91,7 @@ describe('instrumentAnthropic', () => {
     const body = JSON.parse(fetchMock.mock.calls[0][1].body) as TracePayload;
     expect(body.spans[0].status).toBe('error');
     expect(body.spans[0].attributes['error.message']).toBe('API Error');
+    expect(body.spans[0].attributes['error.name']).toBe('Error');
   });
 
   it('links span to parent trace via AsyncLocalStorage when called inside trace.trace()', async () => {

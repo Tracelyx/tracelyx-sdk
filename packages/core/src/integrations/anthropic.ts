@@ -106,6 +106,7 @@ export function instrumentAnthropic<T extends AnthropicLike>(
       if (error instanceof Error) {
         attributes['error.message'] = error.message;
         attributes['error.stack'] = error.stack;
+        attributes['error.name'] = error.name;
       }
       throw error;
     } finally {

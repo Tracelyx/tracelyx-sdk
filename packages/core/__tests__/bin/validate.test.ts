@@ -457,4 +457,27 @@ describe('validate command', () => {
     }
     expect(exitSpy).toHaveBeenCalledWith(0);
   });
+
+  it('parses --flag=value equals-syntax (as documented in the roadmap example)', async () => {
+    vi.stubEnv('TRACELYX_VALIDATE_RETRY_DELAY_MS', '0');
+    const fetchMock = mockPostOkGetTrace([{ status: 200, body: { id: 't-1', tenantId: 'acme-corp' } }]);
+    vi.stubGlobal('fetch', fetchMock);
+    vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+    const exitSpy = vi.spyOn(process, 'exit').mockImplementation(((code?: number) => {
+      throw new Error(`exit(${code})`);
+    }) as (code?: number) => never);
+
+    try {
+      await runValidateCommand(['--api-key=tl_test', '--project-id=proj_1', '--tenant=acme-corp']);
+    } catch {
+      // expected
+    }
+
+    expect(exitSpy).toHaveBeenCalledWith(0);
+    const post = fetchMock.mock.calls.find(([, init]) => init?.method === 'POST')!;
+    const payload = JSON.parse(post[1].body);
+    expect(payload.projectId).toBe('proj_1');
+    expect(payload.tenantId).toBe('acme-corp');
+    expect((post[1].headers as Record<string, string>).Authorization).toBe('Bearer tl_test');
+  });
 });

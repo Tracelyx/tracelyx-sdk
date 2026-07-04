@@ -10,10 +10,6 @@ Monorepo for the Tracelyx AI observability SDK.
 
 ## Quick Start
 
-```bash
-npm install @tracelyx/core
-```
-
 ```typescript
 import { TracelyxClient } from '@tracelyx/core';
 

@@ -2,12 +2,6 @@
 
 Minimal observability SDK for AI agents. Zero dependencies, < 20KB gzip.
 
-## Install
-
-```bash
-npm install @tracelyx/core
-```
-
 ## Quickstart
 
 ```typescript

@@ -7,6 +7,10 @@ import type { SpanPayload } from '../src/types.js';
 // ── Shared helpers ─────────────────────────────────────────────────────────
 
 function flagValue(args: string[], flag: string): string | undefined {
+  // Support both space-separated (`--flag value`) and equals (`--flag=value`) forms.
+  const eq = `${flag}=`;
+  const inline = args.find((a) => a.startsWith(eq));
+  if (inline !== undefined) return inline.slice(eq.length);
   const idx = args.indexOf(flag);
   return idx >= 0 ? args[idx + 1] : undefined;
 }
@@ -20,6 +24,7 @@ function buildHookSpan(
   const now = Date.now();
   const executionMs =
     typeof hookData['execution_ms'] === 'number' ? hookData['execution_ms'] : 0;
+  const hasError = typeof hookData['tool_error'] === 'string';
 
   return {
     id: randomUUID(),
@@ -30,10 +35,11 @@ function buildHookSpan(
     startTime: now - executionMs,
     endTime: now,
     durationMs: executionMs,
-    status: 'ok',
+    status: hasError ? 'error' : 'ok',
     attributes: {
       'hook.name': hookName,
       'hook.session_id': sessionId,
+      ...(hasError && { 'error.type': 'hook_error' }),
       ...(hookData['tool_name'] !== undefined && { 'hook.tool_name': hookData['tool_name'] }),
       ...(hookData['tool_input'] !== undefined && {
         'hook.original_input': JSON.stringify(hookData['tool_input']),
@@ -44,7 +50,7 @@ function buildHookSpan(
       ...(typeof hookData['execution_ms'] === 'number' && {
         'hook.execution_ms': hookData['execution_ms'],
       }),
-      ...(typeof hookData['tool_error'] === 'string' && {
+      ...(hasError && {
         'hook.error': hookData['tool_error'],
       }),
       ...(hookData['modified_input'] !== undefined && {
@@ -126,7 +132,7 @@ async function runHookListenerCommand(args: string[]): Promise<void> {
   });
 }
 
-// ── validate command (stub — tests added in Task 7) ────────────────────────
+// ── validate command ─────────────────────────────────────────────────────
 
 export async function runValidateCommand(args: string[]): Promise<void> {
   const apiKey = flagValue(args, '--api-key') ?? process.env['TRACELYX_API_KEY'];
@@ -192,18 +198,71 @@ export async function runValidateCommand(args: string[]): Promise<void> {
     return;
   }
 
-  clearTimeout(timer);
-
   if (response.status === 401) {
+    clearTimeout(timer);
     out({ ok: false, error: 'ERROR: API key is invalid or expired. Get a new key at https://app.tracelyx.dev' });
     process.exit(1);
-  } else if (response.ok) {
-    out({ ok: true, message: `✓ Tracelyx configured correctly. Test trace ID: ${testTraceId}. View it at https://app.tracelyx.dev/traces/${testTraceId}` });
-    process.exit(0);
-  } else {
+    return;
+  }
+  if (!response.ok) {
+    clearTimeout(timer);
     out({ ok: false, error: `ERROR: Server returned ${response.status}.` });
     process.exit(1);
+    return;
   }
+
+  // Receipt confirmation: poll GET /v1/traces/:id until the trace is queryable.
+  // The AbortController created before the POST is the single command-wide 10 s
+  // deadline; its signal also bounds every GET attempt below.
+  const retryDelayMs = parseInt(process.env['TRACELYX_VALIDATE_RETRY_DELAY_MS'] ?? '1000', 10);
+  let received: Record<string, unknown> | null = null;
+
+  for (let attempt = 0; attempt < 5 && !controller.signal.aborted; attempt++) {
+    if (attempt > 0) {
+      await new Promise((resolve) => setTimeout(resolve, retryDelayMs));
+      if (controller.signal.aborted) break;
+    }
+    try {
+      const getResponse = await fetch(`${endpoint}/v1/traces/${testTraceId}`, {
+        headers: { Authorization: `Bearer ${apiKey}` },
+        signal: controller.signal,
+      });
+      if (getResponse.ok) {
+        received = (await getResponse.json()) as Record<string, unknown>;
+        break;
+      }
+    } catch {
+      // transient network error — retry (or deadline fired; loop guard exits)
+    }
+  }
+
+  clearTimeout(timer);
+
+  if (received === null) {
+    out({
+      ok: false,
+      error:
+        'ERROR: Test trace was accepted but could not be confirmed via GET /v1/traces/' +
+        `${testTraceId}. Check the ingestion pipeline (or that the ingest API exposes GET /v1/traces/:id).`,
+    });
+    process.exit(1);
+    return;
+  }
+
+  if (tenantId && received['tenantId'] !== tenantId) {
+    out({
+      ok: false,
+      error: `ERROR: tenant routing failed — expected tenantId "${tenantId}", got "${String(received['tenantId'])}".`,
+    });
+    process.exit(1);
+    return;
+  }
+
+  out({
+    ok: true,
+    message: `✓ Tracelyx configured correctly. Test trace ID: ${testTraceId} visible at https://app.tracelyx.dev/traces/${testTraceId}`,
+  });
+  process.exit(0);
 }
 
 // ── CLI router ─────────────────────────────────────────────────────────────

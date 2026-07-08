@@ -76,7 +76,9 @@ for await (const event of app.streamEvents(input, { version: 'v2' })) {
 
 ### OpenAI Agents
 
-`instrumentOpenAIAgents()` accepts a **Runner** or the exported **`run`** function — these execute an agent in `@openai/agents` (the `Agent` class has no `.run()` method). It wraps the call in an `agent_step` span (named after the agent, with `openai.model`) and wraps the agent's tools (`tool.invoke`) in child `tool_call` spans. Handoffs (`transfer_to_*`) get `handoff.target_agent`. You can also pass an `Agent` object to instrument its tools ahead of time; the span for the whole run then comes from the wrapped Runner/`run()`.
+`instrumentOpenAIAgents()` accepts a **Runner** or the exported **`run`** function — these execute an agent in `@openai/agents` (the `Agent` class has no `.run()` method). It wraps the call in an `agent_step` span (named after the agent, with `openai.model`) and wraps the agent's tools (`tool.invoke`) in child `tool_call` spans. You can also pass an `Agent` object to instrument its tools and handoffs ahead of time; the span for the whole run then comes from the wrapped Runner/`run()`.
+
+`handoff.target_agent` is captured when a handoff is declared as a `Handoff` instance — i.e. `handoff(agent)` in `agent.handoffs`, or a `transfer_to_*` function tool in `agent.tools`. Each fired handoff emits a `handoff.<target>` span and is aggregated onto the run's `agent_step` span. The bare `handoffs: [agent]` shorthand (where the SDK builds the `Handoff` internally at run time) and the full per-agent multi-agent topology are **not** captured by this zero-dependency monkey-patch; use `@openai/agents`' `addTraceProcessor` for those (the same path noted below for faithful `llm_call` spans).
 
 ```typescript
 import { instrumentOpenAIAgents } from '@tracelyx/core';

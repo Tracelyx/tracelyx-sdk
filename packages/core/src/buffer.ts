@@ -58,12 +58,13 @@ export class SpanBuffer {
   }
 
   private async runDrain(): Promise<void> {
-    if (this.pending.length === 0) return;
-    const batch = this.pending.splice(0, MAX_BUFFER_SIZE);
-    try {
-      await this.sender(batch);
-    } catch {
-      // silent drop — caller (TracelyxClient) handles retries at the HTTP layer
+    while (this.pending.length > 0) {
+      const batch = this.pending.splice(0, MAX_BUFFER_SIZE);
+      try {
+        await this.sender(batch);
+      } catch {
+        // silent drop — caller (TracelyxClient) handles retries at the HTTP layer
+      }
     }
   }
 }

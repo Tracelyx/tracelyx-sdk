@@ -76,22 +76,24 @@ for await (const event of app.streamEvents(input, { version: 'v2' })) {
 
 ### OpenAI Agents
 
-`instrumentOpenAIAgents()` accepts either an agent or a runner. Multi-agent runs with handoffs automatically propagate a single trace across all agents — all spans share the same `traceId`. Handoff detection records `handoff.target_agent` on the `transfer_to_*` tool span; when instrumenting an agent directly, the agent's own span also aggregates the handoff targets.
+`instrumentOpenAIAgents()` accepts a **Runner** or the exported **`run`** function — these execute an agent in `@openai/agents` (the `Agent` class has no `.run()` method). It wraps the call in an `agent_step` span (named after the agent, with `openai.model`) and wraps the agent's tools (`tool.invoke`) in child `tool_call` spans. Handoffs (`transfer_to_*`) get `handoff.target_agent`. You can also pass an `Agent` object to instrument its tools ahead of time; the span for the whole run then comes from the wrapped Runner/`run()`.
 
 ```typescript
 import { instrumentOpenAIAgents } from '@tracelyx/core';
-import { Agent, Runner } from '@openai/agents';
+import { Agent, Runner, run } from '@openai/agents';
 
-const agent = new Agent(...);
-instrumentOpenAIAgents(agent, tracelyx);
+const agent = new Agent({ name: 'assistant', tools: [/* ... */] });
 
-// or with a runner (wraps the run in an agent_step span and instruments
-// the passed agent's tools/handoffs):
-const runner = new Runner();
-instrumentOpenAIAgents(runner, tracelyx);
+// Option A — Runner:
+const runner = instrumentOpenAIAgents(new Runner(), tracelyx);
 const result = await runner.run(agent, input);
-// Spans are still created with the same traceId across all agents
+
+// Option B — the exported run():
+const tracedRun = instrumentOpenAIAgents(run, tracelyx);
+const result2 = await tracedRun(agent, input);
 ```
+
+> **Note:** the monkey-patch does not see individual model calls, so the integration does not create separate `llm_call` spans or full per-call token counts (tokens are a best-effort aggregate on the `agent_step` span when the `RunResult` exposes them). Faithful `llm_call` spans would require integrating with `@openai/agents`' `addTraceProcessor` — planned separately.
 
 ## CLI
 

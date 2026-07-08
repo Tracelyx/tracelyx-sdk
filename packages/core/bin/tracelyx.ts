@@ -91,6 +91,8 @@ export async function runHookCommand(
 
 // ── hook-listener command ──────────────────────────────────────────────────
 
+const MAX_HOOK_BODY_BYTES = 1_048_576; // 1 MB
+
 async function runHookListenerCommand(args: string[]): Promise<void> {
   const port = parseInt(flagValue(args, '--port') ?? '9735', 10);
   const apiKey = process.env['TRACELYX_API_KEY'];
@@ -114,7 +116,16 @@ async function runHookListenerCommand(args: string[]): Promise<void> {
     }
 
     const chunks: Buffer[] = [];
-    for await (const chunk of req) chunks.push(Buffer.from(chunk));
+    let total = 0;
+    for await (const chunk of req) {
+      total += chunk.length;
+      if (total > MAX_HOOK_BODY_BYTES) {
+        res.writeHead(413).end();
+        req.destroy();
+        return;
+      }
+      chunks.push(Buffer.from(chunk));
+    }
     const body = Buffer.concat(chunks).toString('utf-8');
 
     try {
@@ -127,19 +138,27 @@ async function runHookListenerCommand(args: string[]): Promise<void> {
     }
   });
 
-  server.listen(port, () => {
-    process.stdout.write(`Tracelyx hook listener running on port ${port}\n`);
+  server.listen(port, '127.0.0.1', () => {
+    process.stdout.write(`Tracelyx hook listener running on 127.0.0.1:${port}\n`);
   });
 }
 
 // ── validate command ─────────────────────────────────────────────────────
 
 export async function runValidateCommand(args: string[]): Promise<void> {
-  const apiKey = flagValue(args, '--api-key') ?? process.env['TRACELYX_API_KEY'];
+  const apiKeyFromFlag = flagValue(args, '--api-key');
+  const apiKey = apiKeyFromFlag ?? process.env['TRACELYX_API_KEY'];
   const projectId = flagValue(args, '--project-id') ?? process.env['TRACELYX_PROJECT_ID'];
   const tenantId = flagValue(args, '--tenant');
   const jsonFlag = args.includes('--json');
   const endpoint = process.env['TRACELYX_ENDPOINT'] ?? 'https://ingest.tracelyx.dev';
+
+  if (apiKeyFromFlag !== undefined) {
+    process.stderr.write(
+      'WARNING: --api-key is visible in the process list and shell history. ' +
+        'Prefer the TRACELYX_API_KEY environment variable.\n',
+    );
+  }
 
   function out(data: unknown): void {
     const d = data as Record<string, unknown>;

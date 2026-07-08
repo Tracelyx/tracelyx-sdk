@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { Agent, Runner, tool } from '@openai/agents';
+import { Agent, Runner, tool, handoff } from '@openai/agents';
 import { z } from 'zod';
 import { TracelyxClient } from '../../src/client.js';
 import { instrumentOpenAIAgents } from '../../src/integrations/openai-agents.js';
@@ -48,6 +48,43 @@ describe('instrumentOpenAIAgents — real @openai/agents shapes', () => {
     const toolSpan = body.spans.find((s) => s.kind === 'tool_call');
     expect(toolSpan).toBeDefined();
     expect(toolSpan!.attributes['tool.name']).toBe('echo');
+  });
+
+  it('captures handoff.target_agent from a real handoff(agent) via Handoff.onInvokeHandoff', async () => {
+    // Real handoffs are Handoff instances stored in agent.handoffs (a SEPARATE array from
+    // agent.tools). The runner calls Handoff.onInvokeHandoff at handoff time to resolve the
+    // next agent. With no inputType, onInvokeHandoff just returns the target agent, so we can
+    // exercise it network-free with a fake run context.
+    const billing = new Agent({ name: 'billing' });
+    const theHandoff = handoff(billing);
+    const source = new Agent({ name: 'triage', handoffs: [theHandoff] });
+
+    // Instrumenting the source agent must wrap the Handoff instance stored on source.handoffs.
+    instrumentOpenAIAgents(source, client);
+
+    const stored = (
+      source as unknown as {
+        handoffs: Array<{ onInvokeHandoff(ctx: unknown, args: string): Promise<unknown> }>;
+      }
+    ).handoffs[0];
+
+    // Invoke inside an active run context so the handoff span links to it and the aggregate
+    // Set is fed (mirrors the runner calling onInvokeHandoff within Runner.run).
+    const trace = client.startTrace({ name: 'run', tenantId: 'tenant-h' });
+    const returned = await trace.trace('agent-run', async () =>
+      stored.onInvokeHandoff({} as unknown, '{}'),
+    );
+    await client.flush();
+
+    // The wrapper must preserve the original return value: the real billing Agent instance.
+    expect(returned).toBe(billing);
+
+    const body = JSON.parse(fetchMock.mock.calls[0]?.[1].body ?? '{"spans":[]}') as TracePayload;
+    const handoffSpan = body.spans.find((s) => s.attributes['handoff.target_agent'] === 'billing');
+    expect(handoffSpan).toBeDefined();
+    expect(handoffSpan!.name).toBe('handoff.billing');
+    expect(handoffSpan!.kind).toBe('agent_step');
+    expect(handoffSpan!.tenantId).toBe('tenant-h');
   });
 
   // Full Runner.run loop needs a live model/network. Gated behind an explicit opt-in flag

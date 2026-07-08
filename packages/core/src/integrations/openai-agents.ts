@@ -6,6 +6,7 @@ import type { SpanPayload } from '../types.js';
 
 const INSTRUMENTED = Symbol('tracelyx.instrumented');
 const TOOL_INSTRUMENTED = Symbol('tracelyx.tool.instrumented');
+const HANDOFF_INSTRUMENTED = Symbol('tracelyx.handoff.instrumented');
 
 interface ToolLike {
   name: string;
@@ -90,16 +91,116 @@ function wrapTools(tools: ToolLike[], tracelyxClient: TracelyxClient): void {
   }
 }
 
+function readName(obj: unknown): string | undefined {
+  return obj !== null &&
+    typeof obj === 'object' &&
+    typeof (obj as { name?: unknown }).name === 'string'
+    ? (obj as { name: string }).name
+    : undefined;
+}
+
+interface HandoffLike {
+  onInvokeHandoff: (...args: unknown[]) => unknown;
+  agent?: unknown;
+  agentName?: unknown;
+  toolName?: unknown;
+  [key: string | symbol]: unknown;
+}
+
+// Wrap a real `@openai/agents` `Handoff.onInvokeHandoff`. The runner calls this at handoff
+// time (inside Runner.run, so getActiveContext() is the active run context) to resolve the
+// next agent. We feed the per-run aggregate Set and emit a dedicated handoff span, then return
+// the original result (the target Agent) untouched.
+function wrapHandoff(
+  handoffEntry: HandoffLike,
+  targetName: string,
+  tracelyxClient: TracelyxClient,
+): void {
+  if (handoffEntry[HANDOFF_INSTRUMENTED]) return;
+  const originalOnInvoke = handoffEntry.onInvokeHandoff.bind(handoffEntry);
+
+  handoffEntry.onInvokeHandoff = async function (...args: unknown[]): Promise<unknown> {
+    const ctx = getActiveContext();
+    const spanId = randomUUID();
+    const startTime = Date.now();
+    let status: 'ok' | 'error' = 'ok';
+    const attributes: Record<string, unknown> = { 'handoff.target_agent': targetName };
+    // Feed the agent_step aggregate (createRunSpan joins this Set into handoff.target_agent).
+    ctx?.handoffTargets?.add(targetName);
+
+    try {
+      return await originalOnInvoke(...args);
+    } catch (error) {
+      status = 'error';
+      attributes['error.type'] = classifyError(error);
+      if (error instanceof Error) {
+        attributes['error.message'] = error.message;
+        attributes['error.stack'] = error.stack;
+        attributes['error.name'] = error.name;
+      }
+      throw error;
+    } finally {
+      const endTime = Date.now();
+      const handoffSpan: SpanPayload = {
+        id: spanId,
+        traceId: ctx?.traceId ?? randomUUID(),
+        parentSpanId: ctx?.spanId ?? null,
+        name: `handoff.${targetName}`,
+        kind: 'agent_step',
+        startTime,
+        endTime,
+        durationMs: endTime - startTime,
+        status,
+        attributes,
+        tenantId: ctx?.tenantId,
+      };
+      tracelyxClient.recordSpan(handoffSpan);
+    }
+  };
+
+  handoffEntry[HANDOFF_INSTRUMENTED] = true;
+}
+
 function instrumentHandoffTargets(handoffs: unknown[], tracelyxClient: TracelyxClient): void {
-  for (const handoff of handoffs) {
-    const target =
-      handoff !== null && typeof handoff === 'object' && 'agent' in (handoff as object)
-        ? (handoff as { agent: unknown }).agent
-        : handoff;
+  for (const entry of handoffs) {
+    if (entry === null || typeof entry !== 'object') continue;
+    const e = entry as HandoffLike & { name?: unknown };
+
+    // A real Handoff instance carries a callable `onInvokeHandoff` (the runner invokes it at
+    // handoff time). Anything else is either a `{ agent }` wrapper or a raw Agent shorthand.
+    const isHandoff = typeof e.onInvokeHandoff === 'function';
+
+    let targetAgent: unknown;
+    let targetName: string | undefined;
+    if (isHandoff) {
+      targetAgent = e.agent;
+      targetName =
+        (typeof e.agentName === 'string' ? e.agentName : undefined) ??
+        readName(e.agent) ??
+        (typeof e.toolName === 'string' && e.toolName.startsWith('transfer_to_')
+          ? e.toolName.slice('transfer_to_'.length)
+          : undefined);
+    } else if ('agent' in e) {
+      targetAgent = e.agent;
+      targetName = readName(e.agent);
+    } else {
+      targetAgent = entry;
+      targetName = readName(entry);
+    }
+
+    // Recursively instrument the target agent's tools + nested handoffs (existing behavior).
     // Real Agents expose no `.run`, so gate only on "is an object". instrumentAgent is a
     // no-op for objects without tools/handoffs, and its INSTRUMENTED guard breaks cycles.
-    if (target !== null && typeof target === 'object') {
-      instrumentAgent(target as AgentLike, tracelyxClient);
+    if (targetAgent !== null && typeof targetAgent === 'object') {
+      instrumentAgent(targetAgent as AgentLike, tracelyxClient);
+    }
+
+    // Only a real Handoff has an onInvokeHandoff to wrap. The bare `handoffs: [agent]`
+    // shorthand has none — the SDK builds the Handoff internally at run time, which this
+    // zero-dep monkey-patch cannot reach, so its fired-handoff cannot be captured here
+    // (use @openai/agents addTraceProcessor for full multi-agent topology).
+    if (isHandoff && typeof targetName === 'string' && targetName.length > 0) {
+      wrapHandoff(e, targetName, tracelyxClient);
     }
   }
 }

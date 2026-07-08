@@ -115,6 +115,39 @@ describe('instrumentOpenAIAgents', () => {
     expect(agentSpan.attributes['handoff.target_agent']).toBe('billing');
   });
 
+  it('records a handoff span and aggregates handoff.target_agent from a Handoff in agent.handoffs', async () => {
+    // Real handoffs live in agent.handoffs as Handoff instances (onInvokeHandoff), NOT in
+    // agent.tools — so the transfer_to_ tool branch never fires for them. The runner invokes
+    // the selected Handoff's onInvokeHandoff at handoff time; that is what we must capture.
+    const billing = { name: 'billing', tools: [] as unknown[] };
+    const handoffObj = {
+      agent: billing,
+      agentName: 'billing',
+      toolName: 'transfer_to_billing',
+      onInvokeHandoff: vi.fn().mockResolvedValue(billing),
+    };
+    const source = { name: 'triage', handoffs: [handoffObj], tools: [] as unknown[] };
+    const runner = {
+      run: vi.fn().mockImplementation(async (a: any) => a.handoffs[0].onInvokeHandoff({}, '{}')),
+    };
+    instrumentOpenAIAgents(runner, client);
+
+    const returned = await runner.run(source, 'I need billing help');
+    await client.flush();
+
+    // The original return value (the target agent) must be preserved exactly.
+    expect(returned).toBe(billing);
+
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body) as TracePayload;
+    const handoffSpan = body.spans.find((s) => s.name === 'handoff.billing');
+    expect(handoffSpan).toBeDefined();
+    expect(handoffSpan!.kind).toBe('agent_step');
+    expect(handoffSpan!.attributes['handoff.target_agent']).toBe('billing');
+    // Aggregated onto the run's agent_step span too.
+    const agentSpan = body.spans.find((s) => s.name === 'agent.triage')!;
+    expect(agentSpan.attributes['handoff.target_agent']).toBe('billing');
+  });
+
   it('records error.type when runner.run rejects', async () => {
     const agent = { name: 'helper' };
     const runner = { run: vi.fn().mockRejectedValue(new Error('rate limit exceeded')) };

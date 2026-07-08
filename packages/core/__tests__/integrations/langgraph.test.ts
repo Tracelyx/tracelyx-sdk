@@ -392,4 +392,32 @@ describe('instrumentLangGraph', () => {
     expect(nodeSpans).toHaveLength(1); // tylko researcher, nie ChatAnthropic
     expect(nodeSpans[0].name).toBe('langgraph.node.researcher');
   });
+
+  it('warns when streamEvents is a non-function value (not just undefined)', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    instrumentLangGraph({ invoke: vi.fn().mockResolvedValue({}), stream: vi.fn(), streamEvents: null } as any, client);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('streamEvents'));
+    warn.mockRestore();
+  });
+
+  it('invoke span omits thread_id/checkpoint_id keys when config is absent', async () => {
+    const graph = { invoke: vi.fn().mockResolvedValue({}) };
+    instrumentLangGraph(graph, client);
+    await graph.invoke({});
+    await client.flush();
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body) as TracePayload;
+    const span = body.spans.find((s) => s.name === 'langgraph.invoke')!;
+    expect('langgraph.thread_id' in span.attributes).toBe(false);
+    expect('langgraph.checkpoint_id' in span.attributes).toBe(false);
+  });
+
+  it('invoke span carries checkpoint_id when provided in config', async () => {
+    const graph = { invoke: vi.fn().mockResolvedValue({}) };
+    instrumentLangGraph(graph, client);
+    await graph.invoke({}, { configurable: { thread_id: 't1', checkpoint_id: 'ckpt-1' } });
+    await client.flush();
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body) as TracePayload;
+    const span = body.spans.find((s) => s.name === 'langgraph.invoke')!;
+    expect(span.attributes['langgraph.checkpoint_id']).toBe('ckpt-1');
+  });
 });

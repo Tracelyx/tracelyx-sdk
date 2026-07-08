@@ -38,7 +38,7 @@ export function instrumentLangGraph<T extends CompiledGraphLike>(
   const graphAsAny = graph as any;
   if (graphAsAny[INSTRUMENTED]) return graph;
 
-  if (typeof graphAsAny.stream === 'function' && graphAsAny.streamEvents === undefined) {
+  if (typeof graphAsAny.stream === 'function' && typeof graphAsAny.streamEvents !== 'function') {
     console.warn(
       '[Tracelyx] LangGraph: streamEvents not found. Per-node spans and full streaming ' +
         'support require @langchain/langgraph >= 0.2.0.',
@@ -180,8 +180,12 @@ export function instrumentLangGraph<T extends CompiledGraphLike>(
     const startTime = Date.now();
 
     const attributes: Record<string, unknown> = {
-      'langgraph.thread_id': config?.configurable?.thread_id,
-      'langgraph.checkpoint_id': config?.configurable?.checkpoint_id,
+      ...(config?.configurable?.thread_id !== undefined && {
+        'langgraph.thread_id': config.configurable.thread_id,
+      }),
+      ...(config?.configurable?.checkpoint_id !== undefined && {
+        'langgraph.checkpoint_id': config.configurable.checkpoint_id,
+      }),
     };
 
     let status: 'ok' | 'error' = 'ok';

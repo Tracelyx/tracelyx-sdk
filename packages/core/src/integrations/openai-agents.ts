@@ -180,6 +180,10 @@ async function createRunSpan(
   };
   let status: 'ok' | 'error' = 'ok';
   let result: unknown;
+  // Hoisted so the finally block can also set the top-level SpanPayload fields that the
+  // OTLP exporter reads for gen_ai.usage.* (mirrors the Anthropic integration).
+  let promptTokens: number | undefined;
+  let completionTokens: number | undefined;
 
   try {
     result = await runWithContext(
@@ -187,6 +191,8 @@ async function createRunSpan(
       () => originalRun(agentArg, ...args),
     );
     const usage = extractUsage(result);
+    promptTokens = usage.promptTokens;
+    completionTokens = usage.completionTokens;
     if (usage.promptTokens !== undefined) attributes['llm.prompt_tokens'] = usage.promptTokens;
     if (usage.completionTokens !== undefined) {
       attributes['llm.completion_tokens'] = usage.completionTokens;
@@ -218,6 +224,10 @@ async function createRunSpan(
       status,
       attributes,
       tenantId: ctx?.tenantId,
+      // Top-level fields the OTLP exporter maps to gen_ai.request.model / gen_ai.usage.*.
+      ...(agent.model !== undefined && { llmModel: agent.model }),
+      ...(promptTokens !== undefined && { promptTokens }),
+      ...(completionTokens !== undefined && { completionTokens }),
     });
   }
 }

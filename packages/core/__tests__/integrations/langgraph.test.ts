@@ -354,4 +354,42 @@ describe('instrumentLangGraph', () => {
 
     expect(fetchMock).not.toHaveBeenCalled(); // zero spanów
   });
+
+  it('streamEvents nests child-node spans under their parent node via parent_ids', async () => {
+    async function* fakeEvents() {
+      yield { event: 'on_chain_start', name: 'router', run_id: 'p1', parent_ids: ['root'], metadata: { langgraph_node: 'router' } };
+      yield { event: 'on_chain_start', name: 'fetch', run_id: 'c1', parent_ids: ['root', 'p1'], metadata: { langgraph_node: 'fetch' } };
+      yield { event: 'on_chain_end', name: 'fetch', run_id: 'c1', parent_ids: ['root', 'p1'], metadata: { langgraph_node: 'fetch' } };
+      yield { event: 'on_chain_end', name: 'router', run_id: 'p1', parent_ids: ['root'], metadata: { langgraph_node: 'router' } };
+    }
+    const graph = { invoke: vi.fn().mockResolvedValue({}), streamEvents: vi.fn().mockReturnValue(fakeEvents()) };
+    instrumentLangGraph(graph, client);
+
+    for await (const _e of (graph as any).streamEvents({})) { /* drain */ }
+    await client.flush();
+
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body) as TracePayload;
+    const router = body.spans.find((s) => s.name === 'langgraph.node.router')!;
+    const fetchN = body.spans.find((s) => s.name === 'langgraph.node.fetch')!;
+    expect(router).toBeDefined();
+    expect(fetchN.parentSpanId).toBe(router.id); // dziecko pod rodzicem, nie pod invoke
+  });
+
+  it('streamEvents ignores inner runnables that inherit langgraph_node but have a different name', async () => {
+    async function* fakeEvents() {
+      yield { event: 'on_chain_start', name: 'researcher', run_id: 'r1', metadata: { langgraph_node: 'researcher' } };
+      // wewnętrzny runnable dziedziczy metadata.langgraph_node, ale ma inną nazwę -> NIE otwiera node spana
+      yield { event: 'on_chain_start', name: 'ChatAnthropic', run_id: 'inner', metadata: { langgraph_node: 'researcher' } };
+      yield { event: 'on_chain_end', name: 'ChatAnthropic', run_id: 'inner', metadata: { langgraph_node: 'researcher' } };
+      yield { event: 'on_chain_end', name: 'researcher', run_id: 'r1', metadata: { langgraph_node: 'researcher' } };
+    }
+    const graph = { invoke: vi.fn().mockResolvedValue({}), streamEvents: vi.fn().mockReturnValue(fakeEvents()) };
+    instrumentLangGraph(graph, client);
+    for await (const _e of (graph as any).streamEvents({})) { /* drain */ }
+    await client.flush();
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body) as TracePayload;
+    const nodeSpans = body.spans.filter((s) => s.name.startsWith('langgraph.node.'));
+    expect(nodeSpans).toHaveLength(1); // tylko researcher, nie ChatAnthropic
+    expect(nodeSpans[0].name).toBe('langgraph.node.researcher');
+  });
 });

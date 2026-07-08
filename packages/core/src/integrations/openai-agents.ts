@@ -9,7 +9,7 @@ const TOOL_INSTRUMENTED = Symbol('tracelyx.tool.instrumented');
 
 interface ToolLike {
   name: string;
-  on_invoke_tool?(...args: unknown[]): Promise<unknown>;
+  invoke?(...args: unknown[]): Promise<unknown>;
   [key: string | symbol]: unknown;
 }
 
@@ -25,12 +25,12 @@ interface AgentLike {
 function wrapTools(tools: ToolLike[], tracelyxClient: TracelyxClient): void {
   for (const tool of tools) {
     if (tool[TOOL_INSTRUMENTED]) continue;
-    if (typeof tool.on_invoke_tool !== 'function') continue;
+    if (typeof tool.invoke !== 'function') continue;
 
-    const originalToolFn = tool.on_invoke_tool.bind(tool);
+    const originalToolFn = tool.invoke.bind(tool);
     const toolName = tool.name;
 
-    tool.on_invoke_tool = async function (...args: unknown[]): Promise<unknown> {
+    tool.invoke = async function (...args: unknown[]): Promise<unknown> {
       const ctx = getActiveContext();
       const toolSpanId = randomUUID();
       const startTime = Date.now();

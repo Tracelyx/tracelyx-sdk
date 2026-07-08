@@ -1,6 +1,10 @@
 import type { SpanPayload } from './types.js';
 
 const MAX_BUFFER_SIZE = 100;
+// Hard cap on buffered spans. Count-based, NOT byte-based: individual spans may
+// carry large inputPayload/outputPayload, so worst-case retained memory is
+// MAX_PENDING x per-span-size. Drop-oldest on overflow keeps a sustained ingest
+// outage from growing `pending` without bound.
 const MAX_PENDING = 10_000;
 const DEFAULT_FLUSH_INTERVAL_MS = 5_000;
 

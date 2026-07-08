@@ -421,4 +421,19 @@ describe('instrumentLangGraph', () => {
     expect(span.attributes['langgraph.thread_id']).toBe('t1');
     recordSpy.mockRestore();
   });
+
+  it('streamEvents node spans carry langgraph.checkpoint_id from options.configurable', async () => {
+    async function* fakeEvents() {
+      yield { event: 'on_chain_start', name: 'researcher', run_id: 'r1', metadata: { langgraph_node: 'researcher' } };
+      yield { event: 'on_chain_end', name: 'researcher', run_id: 'r1', metadata: { langgraph_node: 'researcher' } };
+    }
+    const graph = { invoke: vi.fn().mockResolvedValue({}), streamEvents: vi.fn().mockReturnValue(fakeEvents()) };
+    instrumentLangGraph(graph, client);
+    for await (const _e of (graph as any).streamEvents({}, { configurable: { thread_id: 't1', checkpoint_id: 'ckpt-9' } })) { /* drain */ }
+    await client.flush();
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body) as TracePayload;
+    const node = body.spans.find((s) => s.name === 'langgraph.node.researcher')!;
+    expect(node.attributes['langgraph.checkpoint_id']).toBe('ckpt-9');
+    expect(node.attributes['langgraph.thread_id']).toBe('t1');
+  });
 });

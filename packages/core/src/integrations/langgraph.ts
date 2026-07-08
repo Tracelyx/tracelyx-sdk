@@ -89,6 +89,9 @@ export function instrumentLangGraph<T extends CompiledGraphLike>(
                 ...(config?.configurable?.thread_id !== undefined && {
                   'langgraph.thread_id': config.configurable.thread_id,
                 }),
+                ...(config?.configurable?.checkpoint_id !== undefined && {
+                  'langgraph.checkpoint_id': config.configurable.checkpoint_id,
+                }),
               },
               tenantId: getActiveContext()?.tenantId,
             };
@@ -158,6 +161,9 @@ export function instrumentLangGraph<T extends CompiledGraphLike>(
                 'langgraph.node_name': name,
                 ...(options?.configurable?.thread_id !== undefined && {
                   'langgraph.thread_id': options.configurable.thread_id,
+                }),
+                ...(options?.configurable?.checkpoint_id !== undefined && {
+                  'langgraph.checkpoint_id': options.configurable.checkpoint_id,
                 }),
               },
               tenantId: ctx?.tenantId,

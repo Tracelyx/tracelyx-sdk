@@ -70,4 +70,18 @@ describe('SpanBuffer', () => {
     expect(sender).toHaveBeenCalledOnce();
     buffer.stop();
   });
+
+  it('drain() flushes ALL pending spans across multiple batches, not just the first 100', async () => {
+    const sent: number[] = [];
+    const sender = vi.fn().mockImplementation(async (spans: unknown[]) => { sent.push(spans.length); });
+    const buffer = new SpanBuffer(sender, 5_000);
+
+    for (let i = 0; i < 250; i++) {
+      (buffer as unknown as { pending: unknown[] }).pending.push({ id: String(i) });
+    }
+    await buffer.drain();
+
+    expect(sent.reduce((a, b) => a + b, 0)).toBe(250); // wszystkie 250, nie 100
+    expect((buffer as unknown as { pending: unknown[] }).pending).toHaveLength(0);
+  });
 });

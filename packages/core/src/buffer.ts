@@ -1,6 +1,7 @@
 import type { SpanPayload } from './types.js';
 
 const MAX_BUFFER_SIZE = 100;
+const MAX_PENDING = 10_000;
 const DEFAULT_FLUSH_INTERVAL_MS = 5_000;
 
 export class SpanBuffer {
@@ -9,6 +10,7 @@ export class SpanBuffer {
   private stopped = false;
   // serializes concurrent drain() calls — prevents race condition on splice()
   private drainingPromise: Promise<void> | null = null;
+  private overflowWarned = false;
 
   constructor(
     private readonly sender: (spans: SpanPayload[]) => Promise<void>,
@@ -18,6 +20,16 @@ export class SpanBuffer {
   add(span: SpanPayload): void {
     if (this.stopped) return;
     this.pending.push(span);
+    if (this.pending.length > MAX_PENDING) {
+      this.pending.shift(); // drop-oldest
+      if (!this.overflowWarned) {
+        this.overflowWarned = true;
+        console.warn(
+          `[Tracelyx] Span buffer exceeded ${MAX_PENDING} pending spans; ` +
+            'dropping oldest. Ingest endpoint may be unreachable.',
+        );
+      }
+    }
     if (this.pending.length >= MAX_BUFFER_SIZE) {
       void this.drain();
     } else {

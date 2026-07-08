@@ -23,6 +23,7 @@ export class TracelyxClient {
   private readonly environment: 'development' | 'staging' | 'production' | undefined;
   private readonly disabled: boolean;
   private readonly buffer: SpanBuffer | null;
+  private dropWarned = false;
 
   constructor(options: TracelyxClientOptions & { otlp?: OtlpOptions }) {
     this.apiKey = options.apiKey;
@@ -90,14 +91,20 @@ export class TracelyxClient {
           await sleep(1000 * 2 ** (attempt - 1));
           return this.sendNative(spans, attempt + 1);
         }
-        // non-retryable (4xx except 429) or max retries reached — silent drop
+        this.warnDropOnce(`HTTP ${res.status}`);
       }
     } catch {
       if (attempt < MAX_RETRIES) {
         await sleep(1000 * 2 ** (attempt - 1));
         return this.sendNative(spans, attempt + 1);
       }
-      // silent drop after max retries — never throw to caller
+      this.warnDropOnce('network error after retries');
     }
+  }
+
+  private warnDropOnce(reason: string): void {
+    if (this.dropWarned) return;
+    this.dropWarned = true;
+    console.warn(`[Tracelyx] Dropping spans permanently (${reason}). Telemetry may be incomplete.`);
   }
 }

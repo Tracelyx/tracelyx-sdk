@@ -18,7 +18,9 @@ interface ToolLike {
 // a carrier of tools + handoffs to instrument; the agent_step span is emitted by the runner.
 interface AgentLike {
   name?: string;
-  model?: string;
+  // Typed `string | Model` by the SDK; a Model object at runtime must NOT be copied verbatim
+  // into span fields (it would emit a non-string gen_ai.request.model / openai.model).
+  model?: unknown;
   tools?: ToolLike[];
   handoffs?: unknown[];
   [key: string | symbol]: unknown;
@@ -170,48 +172,31 @@ async function createRunSpan(
   const spanId = randomUUID();
   const traceId = ctx?.traceId ?? randomUUID();
   const parentSpanId = ctx?.spanId ?? null;
+  const tenantId = ctx?.tenantId;
   const startTime = Date.now();
   const agentName = agent.name ?? 'unknown';
   // Fresh per-run collector — tools attribute their handoff into this via context.
   const handoffTargets = new Set<string>();
   const attributes: Record<string, unknown> = {
     'agent.name': agentName,
-    ...(agent.model !== undefined && { 'openai.model': agent.model }),
+    // RF-4: only a string model is a valid attribute value; a Model object is omitted.
+    ...(typeof agent.model === 'string' && { 'openai.model': agent.model }),
   };
-  let status: 'ok' | 'error' = 'ok';
-  let result: unknown;
-  // Hoisted so the finally block can also set the top-level SpanPayload fields that the
-  // OTLP exporter reads for gen_ai.usage.* (mirrors the Anthropic integration).
-  let promptTokens: number | undefined;
-  let completionTokens: number | undefined;
 
-  try {
-    result = await runWithContext(
-      { spanId, traceId, tenantId: ctx?.tenantId, handoffTargets },
-      () => originalRun(agentArg, ...args),
-    );
-    const usage = extractUsage(result);
-    promptTokens = usage.promptTokens;
-    completionTokens = usage.completionTokens;
+  // Records the agent_step span exactly once. Called either immediately (non-stream / error)
+  // or, for streamed runs, from the `.completed` callback. It uses the CAPTURED span context
+  // variables (spanId/traceId/parentSpanId/tenantId), never getActiveContext(), because the
+  // deferred streamed invocation runs outside the AsyncLocalStorage context of the run.
+  function recordFinal(finalStatus: 'ok' | 'error', resultForUsage: unknown): void {
+    const endTime = Date.now();
+    const usage = extractUsage(resultForUsage);
     if (usage.promptTokens !== undefined) attributes['llm.prompt_tokens'] = usage.promptTokens;
     if (usage.completionTokens !== undefined) {
       attributes['llm.completion_tokens'] = usage.completionTokens;
     }
-    return result;
-  } catch (error) {
-    status = 'error';
-    attributes['error.type'] = classifyError(error);
-    if (error instanceof Error) {
-      attributes['error.message'] = error.message;
-      attributes['error.stack'] = error.stack;
-      attributes['error.name'] = error.name;
-    }
-    throw error;
-  } finally {
     if (handoffTargets.size > 0) {
       attributes['handoff.target_agent'] = [...handoffTargets].join(',');
     }
-    const endTime = Date.now();
     tracelyxClient.recordSpan({
       id: spanId,
       traceId,
@@ -221,15 +206,58 @@ async function createRunSpan(
       startTime,
       endTime,
       durationMs: endTime - startTime,
-      status,
+      status: finalStatus,
       attributes,
-      tenantId: ctx?.tenantId,
+      tenantId,
       // Top-level fields the OTLP exporter maps to gen_ai.request.model / gen_ai.usage.*.
-      ...(agent.model !== undefined && { llmModel: agent.model }),
-      ...(promptTokens !== undefined && { promptTokens }),
-      ...(completionTokens !== undefined && { completionTokens }),
+      // RF-4: skip llmModel entirely when the model isn't a string (Model object).
+      ...(typeof agent.model === 'string' && { llmModel: agent.model }),
+      ...(usage.promptTokens !== undefined && { promptTokens: usage.promptTokens }),
+      ...(usage.completionTokens !== undefined && { completionTokens: usage.completionTokens }),
     });
   }
+
+  let result: unknown;
+  try {
+    result = await runWithContext(
+      { spanId, traceId, tenantId, handoffTargets },
+      () => originalRun(agentArg, ...args),
+    );
+  } catch (error) {
+    attributes['error.type'] = classifyError(error);
+    if (error instanceof Error) {
+      attributes['error.message'] = error.message;
+      attributes['error.stack'] = error.stack;
+      attributes['error.name'] = error.name;
+    }
+    recordFinal('error', undefined);
+    throw error;
+  }
+
+  // RF-3: a streamed run (run(..., { stream: true })) resolves with a StreamedRunResult
+  // IMMEDIATELY, before the model output is consumed — usage/timing are only final once its
+  // `.completed` promise resolves. Duck-type it (no SDK import → zero runtime deps): a plain
+  // RunResult has no `completed` thenable.
+  const streamed =
+    result !== null &&
+    typeof result === 'object' &&
+    typeof (result as { completed?: { then?: unknown } }).completed?.then === 'function';
+
+  if (streamed) {
+    // Defer recording until the stream drains. Caveat: if the caller never consumes the stream,
+    // `completed` never resolves and no span is emitted — this mirrors the SDK, which also only
+    // finalizes the run once the stream is drained. The two-argument `.then(onOk, onErr)` form
+    // (not `.then().catch()`) guarantees the span is recorded EXACTLY ONCE: onErr fires only for
+    // the original rejection, never for an error thrown inside onOk.
+    Promise.resolve((result as { completed: Promise<unknown> }).completed).then(
+      () => recordFinal('ok', result),
+      () => recordFinal('error', result),
+    );
+    return result;
+  }
+
+  recordFinal('ok', result);
+  return result;
 }
 
 function instrumentRunner<T extends RunnerLike>(runner: T, tracelyxClient: TracelyxClient): T {

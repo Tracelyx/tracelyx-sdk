@@ -27,6 +27,15 @@ describe('classifyError', () => {
     expect(classifyError(new Error('Request timed out after 30000ms'))).toBe('tool_timeout');
   });
 
+  it('classifies err.name === "TimeoutError" as tool_timeout', () => {
+    expect(classifyError(Object.assign(new Error('deadline'), { name: 'TimeoutError' }))).toBe('tool_timeout');
+  });
+
+  it('timeout message wins over network code (documented branch order)', () => {
+    const err = Object.assign(new Error('socket timeout'), { code: 'ECONNRESET' });
+    expect(classifyError(err)).toBe('tool_timeout');
+  });
+
   it('classifies network error codes and fetch failures as network_error', () => {
     const connRefused = Object.assign(new Error('connect ECONNREFUSED'), { code: 'ECONNREFUSED' });
     expect(classifyError(connRefused)).toBe('network_error');

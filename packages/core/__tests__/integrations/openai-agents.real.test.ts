@@ -62,17 +62,29 @@ describe('instrumentOpenAIAgents — real @openai/agents shapes', () => {
     // Instrumenting the source agent must wrap the Handoff instance stored on source.handoffs.
     instrumentOpenAIAgents(source, client);
 
-    const stored = (
+    // Resolve the handoff through the SDK's OWN lookup — the exact path Runner.run uses
+    // (runImplementation → agent.getEnabledHandoffs → handoffMap → toolExecution invokes
+    // handoff.onInvokeHandoff). This guards that the object we mutate in place is the one the
+    // runtime actually resolves and invokes — not merely that our wrapper works when called
+    // directly. `getEnabledHandoffs` is network-free here: getHandoff() returns the same Handoff
+    // instance and the default `isEnabled` is `async () => true` (ignores the run context).
+    const enabled = await (
       source as unknown as {
-        handoffs: Array<{ onInvokeHandoff(ctx: unknown, args: string): Promise<unknown> }>;
+        getEnabledHandoffs: (
+          ctx: unknown,
+        ) => Promise<Array<{ onInvokeHandoff(ctx: unknown, args: string): Promise<unknown> }>>;
       }
-    ).handoffs[0];
+    ).getEnabledHandoffs({});
+    // The runtime resolves to the very Handoff object we wrapped in place.
+    expect(enabled[0]).toBe(
+      (source as unknown as { handoffs: unknown[] }).handoffs[0],
+    );
 
     // Invoke inside an active run context so the handoff span links to it and the aggregate
     // Set is fed (mirrors the runner calling onInvokeHandoff within Runner.run).
     const trace = client.startTrace({ name: 'run', tenantId: 'tenant-h' });
     const returned = await trace.trace('agent-run', async () =>
-      stored.onInvokeHandoff({} as unknown, '{}'),
+      enabled[0].onInvokeHandoff({} as unknown, '{}'),
     );
     await client.flush();
 

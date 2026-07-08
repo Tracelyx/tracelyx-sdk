@@ -38,6 +38,18 @@ describe('instrumentOpenAIAgents', () => {
     expect(span.status).toBe('ok');
   });
 
+  it('aggregates token usage from RunResult.runContext.usage onto the agent_step span', async () => {
+    const agent = { name: 'A', model: 'gpt-4o' };
+    const runner = { run: vi.fn().mockResolvedValue({ runContext: { usage: { inputTokens: 12, outputTokens: 3 } } }) };
+    instrumentOpenAIAgents(runner, client);
+    await runner.run(agent, 'x');
+    await client.flush();
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body) as TracePayload;
+    const span = body.spans.find((s) => s.kind === 'agent_step')!;
+    expect(span.attributes['llm.prompt_tokens']).toBe(12);
+    expect(span.attributes['llm.completion_tokens']).toBe(3);
+  });
+
   it('creates tool_call child spans via tool.invoke, nested under the run span', async () => {
     const tool = { name: 'search_web', invoke: vi.fn().mockResolvedValue('result') };
     const agent = { name: 'SupportAgent', tools: [tool] };

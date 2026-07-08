@@ -20,6 +20,7 @@ interface StreamEventLike {
   event?: string;
   name?: string;
   run_id?: string;
+  parent_ids?: string[];
   metadata?: { langgraph_node?: string; [key: string]: unknown };
 }
 
@@ -113,7 +114,8 @@ export function instrumentLangGraph<T extends CompiledGraphLike>(
       const ctx = getActiveContext();
       const traceId = ctx?.traceId ?? randomUUID();
       const parentSpanId = ctx?.spanId ?? null;
-      const openNodes = new Map<string, { name: string; startTime: number }>();
+      const openNodes = new Map<string, { name: string; startTime: number; spanId: string }>();
+      const runIdToSpanId = new Map<string, string>();
 
       for await (const event of originalStreamEvents(input, options, ...rest)) {
         const e = event as StreamEventLike;
@@ -121,15 +123,30 @@ export function instrumentLangGraph<T extends CompiledGraphLike>(
 
         if (nodeName !== undefined && e.run_id !== undefined) {
           if (e.event === 'on_chain_start' && e.name === nodeName) {
-            openNodes.set(e.run_id, { name: nodeName, startTime: Date.now() });
+            // Przydziel spanId na starcie, by potomny węzeł mógł wskazać ten span jako rodzica.
+            const nodeSpanId = randomUUID();
+            runIdToSpanId.set(e.run_id, nodeSpanId);
+            openNodes.set(e.run_id, { name: nodeName, startTime: Date.now(), spanId: nodeSpanId });
           } else if (e.event === 'on_chain_end' && openNodes.has(e.run_id)) {
-            const { name, startTime } = openNodes.get(e.run_id)!;
+            const { name, startTime, spanId: nodeSpanId } = openNodes.get(e.run_id)!;
             openNodes.delete(e.run_id);
             const now = Date.now();
+
+            // Rodzic = najbliższy przodek z parent_ids, który jest znanym node spanem; inaczej span invoke.
+            let nodeParentSpanId = parentSpanId;
+            const ancestors = e.parent_ids ?? [];
+            for (let i = ancestors.length - 1; i >= 0; i--) {
+              const candidate = runIdToSpanId.get(ancestors[i]);
+              if (candidate !== undefined && candidate !== nodeSpanId) {
+                nodeParentSpanId = candidate;
+                break;
+              }
+            }
+
             tracelyxClient.recordSpan({
-              id: randomUUID(),
+              id: nodeSpanId,
               traceId,
-              parentSpanId,
+              parentSpanId: nodeParentSpanId,
               name: `langgraph.node.${name}`,
               kind: 'agent_step',
               startTime,

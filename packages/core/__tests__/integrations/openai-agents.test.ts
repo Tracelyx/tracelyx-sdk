@@ -48,6 +48,10 @@ describe('instrumentOpenAIAgents', () => {
     const span = body.spans.find((s) => s.kind === 'agent_step')!;
     expect(span.attributes['llm.prompt_tokens']).toBe(12);
     expect(span.attributes['llm.completion_tokens']).toBe(3);
+    // Top-level SpanPayload fields the OTLP exporter reads for gen_ai.usage.* / model.
+    expect(span.promptTokens).toBe(12);
+    expect(span.completionTokens).toBe(3);
+    expect(span.llmModel).toBe('gpt-4o');
   });
 
   it('creates tool_call child spans via tool.invoke, nested under the run span', async () => {

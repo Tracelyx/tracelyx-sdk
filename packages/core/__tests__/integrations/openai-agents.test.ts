@@ -382,6 +382,28 @@ describe('instrumentOpenAIAgents', () => {
     expect(span.status).toBe('ok');
   });
 
+  it('streamed run whose completed rejects records status=error with classified error.type (exactly one span)', async () => {
+    let rejectCompleted: (e: unknown) => void = () => {};
+    const completed = new Promise((_res, rej) => {
+      rejectCompleted = rej;
+    });
+    completed.catch(() => {}); // avoid unhandled rejection noise
+    const agent = { name: 'A', model: 'gpt-4o' };
+    const streamed = { completed, runContext: { usage: {} }, async *[Symbol.asyncIterator]() {} };
+    const runner = { run: vi.fn().mockResolvedValue(streamed) };
+    instrumentOpenAIAgents(runner, client);
+    const result = await runner.run(agent, 'x', { stream: true });
+    expect(result).toBe(streamed); // wrapper returned the StreamedRunResult synchronously
+    rejectCompleted(Object.assign(new Error('rate limit exceeded'), { status: 429 }));
+    await new Promise((r) => setTimeout(r, 0)); // let the onErr microtask run
+    await client.flush();
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body) as TracePayload;
+    const spans = body.spans.filter((s) => s.kind === 'agent_step');
+    expect(spans).toHaveLength(1);
+    expect(spans[0].status).toBe('error');
+    expect(spans[0].attributes['error.type']).toBe('rate_limit');
+  });
+
   it('records exactly one agent_step span on a non-stream run (control for the deferred path)', async () => {
     const agent = { name: 'PlainAgent', model: 'gpt-4o' };
     const runner = {

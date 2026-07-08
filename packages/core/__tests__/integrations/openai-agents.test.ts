@@ -275,6 +275,85 @@ describe('instrumentOpenAIAgents', () => {
     expect(toolNames).toEqual(['ta', 'tb']);
   });
 
+  it('omits llmModel and openai.model when agent.model is a non-string Model object', async () => {
+    // Agent.model is typed `string | Model`; at runtime the runner may carry a Model object.
+    // Copying it verbatim would emit an invalid non-string gen_ai.request.model / openai.model.
+    const modelObject = { name: 'gpt-4o', getResponse: () => undefined };
+    const agent = { name: 'ModelObjAgent', model: modelObject };
+    const runner = { run: vi.fn().mockResolvedValue({}) };
+    instrumentOpenAIAgents(runner, client);
+
+    await runner.run(agent, 'x');
+    await client.flush();
+
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body) as TracePayload;
+    const span = body.spans.find((s) => s.kind === 'agent_step')!;
+    expect(span.llmModel).toBeUndefined();
+    expect(span.attributes['openai.model']).toBeUndefined();
+  });
+
+  it('defers the agent_step span for streamed runs until completed resolves (usage read after stream drains)', async () => {
+    // A real streamed run resolves with a StreamedRunResult BEFORE the model output is
+    // consumed: runContext.usage is still empty at setup and only aggregates as the stream
+    // drains. `completed` resolves once draining finishes. This fake mirrors that: usage is
+    // empty at setup and populated exactly when `completed` resolves.
+    const agent = { name: 'StreamAgent', model: 'gpt-4o' };
+    const usage: { inputTokens?: number; outputTokens?: number } = {};
+    let resolveCompleted!: () => void;
+    const completed = new Promise<void>((r) => {
+      resolveCompleted = r;
+    });
+    const streamedResult = {
+      runContext: { usage },
+      async *[Symbol.asyncIterator]() {
+        /* nothing to yield in the mock */
+      },
+      completed,
+    };
+    const runner = { run: vi.fn().mockResolvedValue(streamedResult) };
+    instrumentOpenAIAgents(runner, client);
+
+    const returned = await runner.run(agent, 'x', { stream: true });
+    // The wrapper must hand back the exact StreamedRunResult so the caller can consume it.
+    expect(returned).toBe(streamedResult);
+
+    // At setup usage is still empty (the buggy code records HERE with no tokens). Now simulate
+    // the stream draining: usage aggregates, then `completed` resolves — the fix records only now.
+    usage.inputTokens = 7;
+    usage.outputTokens = 2;
+    resolveCompleted();
+
+    // Drain microtasks so the `.completed` callback (and thus recordFinal) runs BEFORE flush.
+    await new Promise((r) => setTimeout(r, 0));
+    await client.flush();
+
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body) as TracePayload;
+    const span = body.spans.find((s) => s.kind === 'agent_step')!;
+    // Usage read AFTER completed — not the empty setup-time read.
+    expect(span.promptTokens).toBe(7);
+    expect(span.completionTokens).toBe(2);
+    expect(span.attributes['llm.prompt_tokens']).toBe(7);
+    expect(span.attributes['llm.completion_tokens']).toBe(2);
+    expect(span.status).toBe('ok');
+  });
+
+  it('records exactly one agent_step span on a non-stream run (control for the deferred path)', async () => {
+    const agent = { name: 'PlainAgent', model: 'gpt-4o' };
+    const runner = {
+      run: vi.fn().mockResolvedValue({ runContext: { usage: { inputTokens: 4, outputTokens: 1 } } }),
+    };
+    instrumentOpenAIAgents(runner, client);
+
+    await runner.run(agent, 'x');
+    await client.flush();
+
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body) as TracePayload;
+    const agentSpans = body.spans.filter((s) => s.kind === 'agent_step');
+    expect(agentSpans).toHaveLength(1);
+    expect(agentSpans[0].promptTokens).toBe(4);
+    expect(agentSpans[0].completionTokens).toBe(1);
+  });
+
   it('keeps handoff.target_agent per-run under concurrent runs of the same agent instance', async () => {
     // Run A hands off to billing then parks; run B hands off to refunds and finishes
     // while A is still in flight. Each run's agent_step must carry ONLY its own target.

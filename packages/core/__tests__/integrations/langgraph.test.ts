@@ -401,23 +401,24 @@ describe('instrumentLangGraph', () => {
   });
 
   it('invoke span omits thread_id/checkpoint_id keys when config is absent', async () => {
+    const recordSpy = vi.spyOn(client, 'recordSpan');
     const graph = { invoke: vi.fn().mockResolvedValue({}) };
     instrumentLangGraph(graph, client);
     await graph.invoke({});
-    await client.flush();
-    const body = JSON.parse(fetchMock.mock.calls[0][1].body) as TracePayload;
-    const span = body.spans.find((s) => s.name === 'langgraph.invoke')!;
-    expect('langgraph.thread_id' in span.attributes).toBe(false);
-    expect('langgraph.checkpoint_id' in span.attributes).toBe(false);
+    const span = recordSpy.mock.calls[0][0];
+    expect(Object.keys(span.attributes)).not.toContain('langgraph.thread_id');
+    expect(Object.keys(span.attributes)).not.toContain('langgraph.checkpoint_id');
+    recordSpy.mockRestore();
   });
 
   it('invoke span carries checkpoint_id when provided in config', async () => {
+    const recordSpy = vi.spyOn(client, 'recordSpan');
     const graph = { invoke: vi.fn().mockResolvedValue({}) };
     instrumentLangGraph(graph, client);
     await graph.invoke({}, { configurable: { thread_id: 't1', checkpoint_id: 'ckpt-1' } });
-    await client.flush();
-    const body = JSON.parse(fetchMock.mock.calls[0][1].body) as TracePayload;
-    const span = body.spans.find((s) => s.name === 'langgraph.invoke')!;
+    const span = recordSpy.mock.calls[0][0];
     expect(span.attributes['langgraph.checkpoint_id']).toBe('ckpt-1');
+    expect(span.attributes['langgraph.thread_id']).toBe('t1');
+    recordSpy.mockRestore();
   });
 });

@@ -162,4 +162,26 @@ describe('TracelyxClient', () => {
     warn.mockRestore();
     vi.unstubAllGlobals();
   });
+
+  it('splits a mixed-tenant batch into one POST per tenant with correct envelope tenantId', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response('{"accepted":1}', { status: 200 }));
+    vi.stubGlobal('fetch', fetchMock);
+    const client = new TracelyxClient({ apiKey: 'tl_test', projectId: 'proj_1' });
+
+    const mk = (id: string, tenantId?: string) => ({
+      id, traceId: id, parentSpanId: null, name: 'x', kind: 'custom' as const,
+      startTime: 0, endTime: 0, durationMs: 0, status: 'ok' as const, attributes: {}, tenantId,
+    });
+    client.recordSpan(mk('a', 'acme'));
+    client.recordSpan(mk('b', 'globex'));
+    client.recordSpan(mk('c', 'acme'));
+    await client.flush();
+
+    const bodies = fetchMock.mock.calls.map((c) => JSON.parse(c[1].body));
+    const byTenant = Object.fromEntries(bodies.map((b) => [b.tenantId, b.spans.length]));
+    expect(byTenant['acme']).toBe(2);
+    expect(byTenant['globex']).toBe(1);
+    bodies.forEach((b) => b.spans.forEach((s: { tenantId?: string }) => expect(s.tenantId).toBe(b.tenantId)));
+    vi.unstubAllGlobals();
+  });
 });

@@ -93,6 +93,41 @@ export async function runHookCommand(
 
 const MAX_HOOK_BODY_BYTES = 1_048_576; // 1 MB
 
+export function createHookListenerServer(client: TracelyxClient): import('http').Server {
+  return createServer(async (req, res) => {
+    if (req.method !== 'POST' || req.url !== '/hook') {
+      res.writeHead(404).end();
+      return;
+    }
+
+    const chunks: Buffer[] = [];
+    let total = 0;
+    for await (const chunk of req) {
+      total += chunk.length;
+      if (total > MAX_HOOK_BODY_BYTES) {
+        // Stop consuming the request (TCP backpressure halts the sender) and
+        // send a clean 413, then close the socket. Do NOT req.destroy() here —
+        // req and res share the socket, and destroying it races the buffered
+        // 413 response, so the client often sees ECONNRESET instead of a
+        // clean 413.
+        res.writeHead(413, { Connection: 'close' }).end();
+        return;
+      }
+      chunks.push(Buffer.from(chunk));
+    }
+    const body = Buffer.concat(chunks).toString('utf-8');
+
+    try {
+      const hookData = JSON.parse(body) as Record<string, unknown>;
+      const hookName = typeof hookData['event'] === 'string' ? hookData['event'] : 'UnknownEvent';
+      client.recordSpan(buildHookSpan(hookName, hookData));
+      res.writeHead(200, { 'Content-Type': 'application/json' }).end('{"ok":true}');
+    } catch {
+      res.writeHead(400).end();
+    }
+  });
+}
+
 async function runHookListenerCommand(args: string[]): Promise<void> {
   const port = parseInt(flagValue(args, '--port') ?? '9735', 10);
   const apiKey = process.env['TRACELYX_API_KEY'];
@@ -109,34 +144,7 @@ async function runHookListenerCommand(args: string[]): Promise<void> {
     endpoint: process.env['TRACELYX_ENDPOINT'],
   });
 
-  const server = createServer(async (req, res) => {
-    if (req.method !== 'POST' || req.url !== '/hook') {
-      res.writeHead(404).end();
-      return;
-    }
-
-    const chunks: Buffer[] = [];
-    let total = 0;
-    for await (const chunk of req) {
-      total += chunk.length;
-      if (total > MAX_HOOK_BODY_BYTES) {
-        res.writeHead(413).end();
-        req.destroy();
-        return;
-      }
-      chunks.push(Buffer.from(chunk));
-    }
-    const body = Buffer.concat(chunks).toString('utf-8');
-
-    try {
-      const hookData = JSON.parse(body) as Record<string, unknown>;
-      const hookName = typeof hookData['event'] === 'string' ? hookData['event'] : 'UnknownEvent';
-      client.recordSpan(buildHookSpan(hookName, hookData));
-      res.writeHead(200, { 'Content-Type': 'application/json' }).end('{"ok":true}');
-    } catch {
-      res.writeHead(400).end();
-    }
-  });
+  const server = createHookListenerServer(client);
 
   server.listen(port, '127.0.0.1', () => {
     process.stdout.write(`Tracelyx hook listener running on 127.0.0.1:${port}\n`);

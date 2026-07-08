@@ -419,6 +419,25 @@ describe('validate command', () => {
     expect(stdoutLines.join('')).toContain('accepted but could not be confirmed');
   });
 
+  it('exits 1 when POST is ok but GET rejects on every attempt (receipt not confirmed)', async () => {
+    vi.stubEnv('TRACELYX_VALIDATE_RETRY_DELAY_MS', '0');
+    const fetchMock = vi.fn().mockImplementation((_url: string, init?: RequestInit) => {
+      if (init?.method === 'POST') return Promise.resolve(new Response('{"accepted":1}', { status: 200 }));
+      return Promise.reject(new Error('boom')); // GET zawsze rzuca
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const out: string[] = [];
+    vi.spyOn(process.stdout, 'write').mockImplementation((c) => { out.push(String(c)); return true; });
+    const exitSpy = vi.spyOn(process, 'exit').mockImplementation(((code?: number) => {
+      throw new Error(`exit(${code})`);
+    }) as (code?: number) => never);
+
+    try { await runValidateCommand(['--api-key', 'tl_test', '--project-id', 'proj_1']); } catch { /* expected */ }
+
+    expect(exitSpy).toHaveBeenCalledWith(1);
+    expect(out.join('')).toContain('accepted but could not be confirmed');
+  });
+
   it('verifies tenant routing: exits 1 when GET returns different tenantId', async () => {
     vi.stubEnv('TRACELYX_VALIDATE_RETRY_DELAY_MS', '0');
     const fetchMock = mockPostOkGetTrace([{ status: 200, body: { id: 't-1', tenantId: 'other-corp' } }]);

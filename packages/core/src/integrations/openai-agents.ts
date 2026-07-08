@@ -377,7 +377,11 @@ function wrapRunFunction(
   originalRun: (...args: unknown[]) => Promise<unknown>,
   tracelyxClient: TracelyxClient,
 ): (...args: unknown[]) => Promise<unknown> {
-  return function (agentArg: unknown, ...args: unknown[]): Promise<unknown> {
+  const originalAsAny = originalRun as unknown as Record<symbol, unknown>;
+  if (originalAsAny[INSTRUMENTED]) return originalRun;
+  const wrapped = function (agentArg: unknown, ...args: unknown[]): Promise<unknown> {
     return createRunSpan(originalRun, agentArg, args, tracelyxClient);
   };
+  (wrapped as unknown as Record<symbol, unknown>)[INSTRUMENTED] = true;
+  return wrapped;
 }

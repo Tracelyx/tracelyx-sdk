@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { Agent, Runner, tool, handoff } from '@openai/agents';
+import { Agent, Runner, tool, handoff, Usage } from '@openai/agents';
 import { z } from 'zod';
 import { TracelyxClient } from '../../src/client.js';
 import { instrumentOpenAIAgents } from '../../src/integrations/openai-agents.js';
@@ -97,6 +97,33 @@ describe('instrumentOpenAIAgents — real @openai/agents shapes', () => {
     expect(handoffSpan!.name).toBe('handoff.billing');
     expect(handoffSpan!.kind).toBe('agent_step');
     expect(handoffSpan!.tenantId).toBe('tenant-h');
+  });
+
+  // extractUsage() (src/integrations/openai-agents.ts) reads result.runContext.usage.inputTokens /
+  // .outputTokens off a plain-object mock in openai-agents.test.ts. That pins the shape against a
+  // hand-rolled fake only. Here we construct a REAL `Usage` from `@openai/agents` (not a fake with
+  // matching field names) so a future rename/relocation of Usage's token fields breaks this test in
+  // CI, without needing a live model call.
+  it('extractUsage reads tokens from a REAL @openai/agents Usage shape', async () => {
+    // Usage's constructor accepts inputTokens/outputTokens directly (see usage.d.ts /
+    // usage.js: `this.inputTokens = input?.inputTokens ?? input?.input_tokens ?? 0`).
+    const usage = new Usage({ inputTokens: 12, outputTokens: 3 });
+    expect(usage.inputTokens).toBe(12);
+    expect(usage.outputTokens).toBe(3);
+
+    const agent = new Agent({ name: 'assistant', model: 'gpt-4o' });
+    const runner = { run: vi.fn().mockResolvedValue({ runContext: { usage } }) };
+    instrumentOpenAIAgents(runner, client);
+
+    await runner.run(agent, 'x');
+    await client.flush();
+
+    const body = JSON.parse(fetchMock.mock.calls[0]?.[1].body ?? '{"spans":[]}') as TracePayload;
+    const span = body.spans.find((s) => s.kind === 'agent_step')!;
+    expect(span.promptTokens).toBe(12);
+    expect(span.completionTokens).toBe(3);
+    expect(span.attributes['llm.prompt_tokens']).toBe(12);
+    expect(span.attributes['llm.completion_tokens']).toBe(3);
   });
 
   // Full Runner.run loop needs a live model/network. Gated behind an explicit opt-in flag

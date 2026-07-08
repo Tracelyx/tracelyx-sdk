@@ -163,6 +163,22 @@ describe('TracelyxClient', () => {
     vi.unstubAllGlobals();
   });
 
+  it('warnDropOnce dedups: warns exactly once even when multiple tenant groups are permanently dropped', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('', { status: 403 })));
+    const client = new TracelyxClient({ apiKey: 'tl_test', projectId: 'proj_1' });
+    const mk = (id: string, tenantId: string) => ({
+      id, traceId: id, parentSpanId: null, name: 'x', kind: 'custom' as const,
+      startTime: 0, endTime: 0, durationMs: 0, status: 'ok' as const, attributes: {}, tenantId,
+    });
+    client.recordSpan(mk('a', 'acme'));
+    client.recordSpan(mk('b', 'globex')); // second tenant -> a second sendGroup, also 403
+    await client.flush();
+    expect(warn).toHaveBeenCalledTimes(1); // dedup across both permanently-dropped groups
+    warn.mockRestore();
+    vi.unstubAllGlobals();
+  });
+
   it('flush() clears its timeout timer once drain wins (no leaked timer)', async () => {
     vi.useFakeTimers();
     const fetchMock = vi.fn().mockResolvedValue(new Response('{"accepted":1}', { status: 200 }));

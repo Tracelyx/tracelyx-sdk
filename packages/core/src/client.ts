@@ -63,10 +63,19 @@ export class TracelyxClient {
     if (!this.buffer) return;
     this.buffer.stop();
     const drain = this.buffer.drain();
-    const timeout = new Promise<void>((resolve) =>
-      setTimeout(resolve, FLUSH_TIMEOUT_MS),
-    );
-    await Promise.race([drain, timeout]);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<void>((resolve) => {
+      timer = setTimeout(resolve, FLUSH_TIMEOUT_MS);
+      // never let this timer keep the process alive (mirrors SpanBuffer's own timer)
+      if (timer && typeof (timer as unknown as { unref?: () => void }).unref === 'function') {
+        (timer as unknown as { unref: () => void }).unref();
+      }
+    });
+    try {
+      await Promise.race([drain, timeout]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
   }
 
   private async sendNative(spans: SpanPayload[]): Promise<void> {

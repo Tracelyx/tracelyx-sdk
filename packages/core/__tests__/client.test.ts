@@ -163,6 +163,20 @@ describe('TracelyxClient', () => {
     vi.unstubAllGlobals();
   });
 
+  it('flush() clears its timeout timer once drain wins (no leaked timer)', async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi.fn().mockResolvedValue(new Response('{"accepted":1}', { status: 200 }));
+    vi.stubGlobal('fetch', fetchMock);
+    const client = new TracelyxClient({ apiKey: 'tl_test', projectId: 'proj_1' });
+    client.recordSpan({ id: '1', traceId: 't', parentSpanId: null, name: 'x', kind: 'custom',
+      startTime: 0, endTime: 0, durationMs: 0, status: 'ok', attributes: {} });
+    await client.flush();
+    // drain resolved; the 10s timeout timer must have been cleared, leaving no pending timers
+    expect(vi.getTimerCount()).toBe(0);
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+  });
+
   it('splits a mixed-tenant batch into one POST per tenant with correct envelope tenantId', async () => {
     const fetchMock = vi.fn().mockResolvedValue(new Response('{"accepted":1}', { status: 200 }));
     vi.stubGlobal('fetch', fetchMock);

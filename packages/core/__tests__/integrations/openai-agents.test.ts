@@ -241,6 +241,18 @@ describe('instrumentOpenAIAgents', () => {
     expect(rawRun).toHaveBeenCalledWith(agent, 'input');
   });
 
+  it('instrumenting an already-instrumented run() function is idempotent (no double spans)', async () => {
+    const agent = { name: 'A', model: 'gpt-4o' };
+    const rawRun = vi.fn().mockResolvedValue({});
+    const run1 = instrumentOpenAIAgents(rawRun, client);
+    const run2 = instrumentOpenAIAgents(run1, client); // must NOT re-wrap
+    expect(run2).toBe(run1);
+    await (run2 as any)(agent, 'x');
+    await client.flush();
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body) as TracePayload;
+    expect(body.spans.filter((s) => s.kind === 'agent_step')).toHaveLength(1);
+  });
+
   it('auto-instruments handoff target agents so their tools emit tool_call spans', async () => {
     const refund = { name: 'refund', invoke: vi.fn().mockResolvedValue('ok') };
     const billing = { name: 'billing', tools: [refund] };

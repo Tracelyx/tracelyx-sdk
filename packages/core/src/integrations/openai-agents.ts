@@ -138,21 +138,19 @@ function instrumentAgent<T extends AgentLike>(agent: T, tracelyxClient: Tracelyx
 }
 
 function extractUsage(result: unknown): { promptTokens?: number; completionTokens?: number } {
-  // Best-effort: a RunResult may expose an aggregate usage. Read it safely without
-  // hard-coupling to a specific shape.
+  // Best-effort: the real @openai/agents RunResult exposes aggregate usage at
+  // runContext.usage (or state.context.usage), a Usage with inputTokens/outputTokens.
+  // Fall back to a top-level `usage` for other shapes. Read safely, no hard coupling.
   const r = result as {
-    usage?: {
-      inputTokens?: number;
-      outputTokens?: number;
-      promptTokens?: number;
-      completionTokens?: number;
-    };
+    usage?: { inputTokens?: number; outputTokens?: number; promptTokens?: number; completionTokens?: number };
+    runContext?: { usage?: { inputTokens?: number; outputTokens?: number } };
+    state?: { context?: { usage?: { inputTokens?: number; outputTokens?: number } } };
   } | null;
-  const u = r?.usage;
+  const u = r?.runContext?.usage ?? r?.state?.context?.usage ?? r?.usage;
   if (!u) return {};
   return {
-    promptTokens: u.inputTokens ?? u.promptTokens,
-    completionTokens: u.outputTokens ?? u.completionTokens,
+    promptTokens: u.inputTokens ?? (u as { promptTokens?: number }).promptTokens,
+    completionTokens: u.outputTokens ?? (u as { completionTokens?: number }).completionTokens,
   };
 }
 

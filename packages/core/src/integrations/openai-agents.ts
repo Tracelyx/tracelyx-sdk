@@ -288,12 +288,21 @@ async function createRunSpan(
   // or, for streamed runs, from the `.completed` callback. It uses the CAPTURED span context
   // variables (spanId/traceId/parentSpanId/tenantId), never getActiveContext(), because the
   // deferred streamed invocation runs outside the AsyncLocalStorage context of the run.
-  function recordFinal(finalStatus: 'ok' | 'error', resultForUsage: unknown): void {
+  function recordFinal(finalStatus: 'ok' | 'error', resultForUsage: unknown, error?: unknown): void {
     const endTime = Date.now();
     const usage = extractUsage(resultForUsage);
     if (usage.promptTokens !== undefined) attributes['llm.prompt_tokens'] = usage.promptTokens;
     if (usage.completionTokens !== undefined) {
       attributes['llm.completion_tokens'] = usage.completionTokens;
+    }
+    // Classify errors in one place so the sync catch and the streamed-failure path stay symmetric.
+    if (finalStatus === 'error' && error !== undefined) {
+      attributes['error.type'] = classifyError(error);
+      if (error instanceof Error) {
+        attributes['error.message'] = error.message;
+        attributes['error.stack'] = error.stack;
+        attributes['error.name'] = error.name;
+      }
     }
     if (handoffTargets.size > 0) {
       attributes['handoff.target_agent'] = [...handoffTargets].join(',');
@@ -325,13 +334,7 @@ async function createRunSpan(
       () => originalRun(agentArg, ...args),
     );
   } catch (error) {
-    attributes['error.type'] = classifyError(error);
-    if (error instanceof Error) {
-      attributes['error.message'] = error.message;
-      attributes['error.stack'] = error.stack;
-      attributes['error.name'] = error.name;
-    }
-    recordFinal('error', undefined);
+    recordFinal('error', undefined, error);
     throw error;
   }
 
@@ -352,7 +355,7 @@ async function createRunSpan(
     // the original rejection, never for an error thrown inside onOk.
     Promise.resolve((result as { completed: Promise<unknown> }).completed).then(
       () => recordFinal('ok', result),
-      () => recordFinal('error', result),
+      (err) => recordFinal('error', result, err),
     );
     return result;
   }

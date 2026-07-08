@@ -69,7 +69,18 @@ export class TracelyxClient {
     await Promise.race([drain, timeout]);
   }
 
-  private async sendNative(spans: SpanPayload[], attempt = 1): Promise<void> {
+  private async sendNative(spans: SpanPayload[]): Promise<void> {
+    const groups = new Map<string | undefined, SpanPayload[]>();
+    for (const span of spans) {
+      const key = span.tenantId;
+      const arr = groups.get(key);
+      if (arr) arr.push(span);
+      else groups.set(key, [span]);
+    }
+    await Promise.all([...groups.values()].map((group) => this.sendGroup(group)));
+  }
+
+  private async sendGroup(spans: SpanPayload[], attempt = 1): Promise<void> {
     const payload: TracePayload = {
       projectId: this.projectId,
       tenantId: spans[0]?.tenantId,
@@ -89,14 +100,14 @@ export class TracelyxClient {
         const retryable = res.status >= 500 || res.status === 429;
         if (retryable && attempt < MAX_RETRIES) {
           await sleep(1000 * 2 ** (attempt - 1));
-          return this.sendNative(spans, attempt + 1);
+          return this.sendGroup(spans, attempt + 1);
         }
         this.warnDropOnce(`HTTP ${res.status}`);
       }
     } catch {
       if (attempt < MAX_RETRIES) {
         await sleep(1000 * 2 ** (attempt - 1));
-        return this.sendNative(spans, attempt + 1);
+        return this.sendGroup(spans, attempt + 1);
       }
       this.warnDropOnce('network error after retries');
     }

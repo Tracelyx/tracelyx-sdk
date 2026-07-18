@@ -23,6 +23,7 @@ export class TracelyxClient {
   private readonly environment: 'development' | 'staging' | 'production' | undefined;
   private readonly disabled: boolean;
   private readonly buffer: SpanBuffer | null;
+  private dropWarned = false;
 
   constructor(options: TracelyxClientOptions & { otlp?: OtlpOptions }) {
     this.apiKey = options.apiKey;
@@ -62,13 +63,33 @@ export class TracelyxClient {
     if (!this.buffer) return;
     this.buffer.stop();
     const drain = this.buffer.drain();
-    const timeout = new Promise<void>((resolve) =>
-      setTimeout(resolve, FLUSH_TIMEOUT_MS),
-    );
-    await Promise.race([drain, timeout]);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<void>((resolve) => {
+      timer = setTimeout(resolve, FLUSH_TIMEOUT_MS);
+      // never let this timer keep the process alive (mirrors SpanBuffer's own timer)
+      if (timer && typeof (timer as unknown as { unref?: () => void }).unref === 'function') {
+        (timer as unknown as { unref: () => void }).unref();
+      }
+    });
+    try {
+      await Promise.race([drain, timeout]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
   }
 
-  private async sendNative(spans: SpanPayload[], attempt = 1): Promise<void> {
+  private async sendNative(spans: SpanPayload[]): Promise<void> {
+    const groups = new Map<string | undefined, SpanPayload[]>();
+    for (const span of spans) {
+      const key = span.tenantId;
+      const arr = groups.get(key);
+      if (arr) arr.push(span);
+      else groups.set(key, [span]);
+    }
+    await Promise.all([...groups.values()].map((group) => this.sendGroup(group)));
+  }
+
+  private async sendGroup(spans: SpanPayload[], attempt = 1): Promise<void> {
     const payload: TracePayload = {
       projectId: this.projectId,
       tenantId: spans[0]?.tenantId,
@@ -88,16 +109,22 @@ export class TracelyxClient {
         const retryable = res.status >= 500 || res.status === 429;
         if (retryable && attempt < MAX_RETRIES) {
           await sleep(1000 * 2 ** (attempt - 1));
-          return this.sendNative(spans, attempt + 1);
+          return this.sendGroup(spans, attempt + 1);
         }
-        // non-retryable (4xx except 429) or max retries reached — silent drop
+        this.warnDropOnce(`HTTP ${res.status}`);
       }
     } catch {
       if (attempt < MAX_RETRIES) {
         await sleep(1000 * 2 ** (attempt - 1));
-        return this.sendNative(spans, attempt + 1);
+        return this.sendGroup(spans, attempt + 1);
       }
-      // silent drop after max retries — never throw to caller
+      this.warnDropOnce('network error after retries');
     }
+  }
+
+  private warnDropOnce(reason: string): void {
+    if (this.dropWarned) return;
+    this.dropWarned = true;
+    console.warn(`[Tracelyx] Dropping spans permanently (${reason}). Telemetry may be incomplete.`);
   }
 }

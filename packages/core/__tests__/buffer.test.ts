@@ -70,4 +70,36 @@ describe('SpanBuffer', () => {
     expect(sender).toHaveBeenCalledOnce();
     buffer.stop();
   });
+
+  it('drain() flushes ALL pending spans across multiple batches, not just the first 100', async () => {
+    const sent: number[] = [];
+    const sender = vi.fn().mockImplementation(async (spans: unknown[]) => { sent.push(spans.length); });
+    const buffer = new SpanBuffer(sender, 5_000);
+
+    for (let i = 0; i < 250; i++) {
+      (buffer as unknown as { pending: unknown[] }).pending.push({ id: String(i) });
+    }
+    await buffer.drain();
+
+    expect(sent.reduce((a, b) => a + b, 0)).toBe(250); // wszystkie 250, nie 100
+    expect(sent).toEqual([100, 100, 50]);
+    expect((buffer as unknown as { pending: unknown[] }).pending).toHaveLength(0);
+  });
+
+  it('caps pending length at MAX_PENDING (drop-oldest) and warns once', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    // sender nigdy nie kończy => brak drenażu
+    const buffer = new SpanBuffer(() => new Promise<void>(() => {}), 5_000);
+    // The pre-existing MAX_BUFFER_SIZE(100) auto-drain trigger fires exactly once
+    // synchronously (draining 100 items) before the never-resolving sender permanently
+    // blocks further drains, so the loop must add well over MAX_PENDING + 100 for the
+    // resting count to actually exceed the cap and exercise the drop-oldest/warn path.
+    for (let i = 0; i < 10_200; i++) buffer.add({ id: String(i) } as never);
+
+    const pending = (buffer as unknown as { pending: unknown[] }).pending;
+    expect(pending.length).toBeLessThanOrEqual(10_000);
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls[0][0]).toContain('[Tracelyx]');
+    warn.mockRestore();
+  });
 });

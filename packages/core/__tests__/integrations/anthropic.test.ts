@@ -94,6 +94,19 @@ describe('instrumentAnthropic', () => {
     expect(body.spans[0].attributes['error.name']).toBe('Error');
   });
 
+  it('sets error.type from classifyError when create rejects', async () => {
+    const anthropic = {
+      messages: { create: vi.fn().mockRejectedValue(Object.assign(new Error('rate limit exceeded'), { status: 429 })) },
+    };
+    instrumentAnthropic(anthropic, client);
+
+    await expect(anthropic.messages.create({ model: 'm', max_tokens: 1, messages: [] })).rejects.toThrow('rate limit');
+    await client.flush();
+
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body) as TracePayload;
+    expect(body.spans[0].attributes['error.type']).toBe('rate_limit');
+  });
+
   it('links span to parent trace via AsyncLocalStorage when called inside trace.trace()', async () => {
     const anthropic = makeAnthropicMock(OK_RESPONSE);
     instrumentAnthropic(anthropic, client);

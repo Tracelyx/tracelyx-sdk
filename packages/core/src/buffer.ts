@@ -1,6 +1,11 @@
 import type { SpanPayload } from './types.js';
 
 const MAX_BUFFER_SIZE = 100;
+// Hard cap on buffered spans. Count-based, NOT byte-based: individual spans may
+// carry large inputPayload/outputPayload, so worst-case retained memory is
+// MAX_PENDING x per-span-size. Drop-oldest on overflow keeps a sustained ingest
+// outage from growing `pending` without bound.
+const MAX_PENDING = 10_000;
 const DEFAULT_FLUSH_INTERVAL_MS = 5_000;
 
 export class SpanBuffer {
@@ -9,6 +14,7 @@ export class SpanBuffer {
   private stopped = false;
   // serializes concurrent drain() calls — prevents race condition on splice()
   private drainingPromise: Promise<void> | null = null;
+  private overflowWarned = false;
 
   constructor(
     private readonly sender: (spans: SpanPayload[]) => Promise<void>,
@@ -18,6 +24,16 @@ export class SpanBuffer {
   add(span: SpanPayload): void {
     if (this.stopped) return;
     this.pending.push(span);
+    if (this.pending.length > MAX_PENDING) {
+      this.pending.shift(); // drop-oldest
+      if (!this.overflowWarned) {
+        this.overflowWarned = true;
+        console.warn(
+          `[Tracelyx] Span buffer exceeded ${MAX_PENDING} pending spans; ` +
+            'dropping oldest. Ingest endpoint may be unreachable.',
+        );
+      }
+    }
     if (this.pending.length >= MAX_BUFFER_SIZE) {
       void this.drain();
     } else {
@@ -58,12 +74,13 @@ export class SpanBuffer {
   }
 
   private async runDrain(): Promise<void> {
-    if (this.pending.length === 0) return;
-    const batch = this.pending.splice(0, MAX_BUFFER_SIZE);
-    try {
-      await this.sender(batch);
-    } catch {
-      // silent drop — caller (TracelyxClient) handles retries at the HTTP layer
+    while (this.pending.length > 0) {
+      const batch = this.pending.splice(0, MAX_BUFFER_SIZE);
+      try {
+        await this.sender(batch);
+      } catch {
+        // silent drop — caller (TracelyxClient) handles retries at the HTTP layer
+      }
     }
   }
 }

@@ -76,22 +76,26 @@ for await (const event of app.streamEvents(input, { version: 'v2' })) {
 
 ### OpenAI Agents
 
-`instrumentOpenAIAgents()` accepts either an agent or a runner. Multi-agent runs with handoffs automatically propagate a single trace across all agents — all spans share the same `traceId`. Handoff detection records `handoff.target_agent` on the `transfer_to_*` tool span; when instrumenting an agent directly, the agent's own span also aggregates the handoff targets.
+`instrumentOpenAIAgents()` accepts a **Runner** or the exported **`run`** function — these execute an agent in `@openai/agents` (the `Agent` class has no `.run()` method). It wraps the call in an `agent_step` span (named after the agent, with `openai.model`) and wraps the agent's tools (`tool.invoke`) in child `tool_call` spans. You can also pass an `Agent` object to instrument its tools and handoffs ahead of time; the span for the whole run then comes from the wrapped Runner/`run()`.
+
+`handoff.target_agent` is captured for handoffs declared as a `Handoff` instance — i.e. `handoff(agent)` placed in the agent's `handoffs` array (`new Agent({ handoffs: [handoff(billing)] })`). When such a handoff fires it emits a `handoff.<target>` span and is aggregated onto the run's `agent_step` span. (If you hand-place a `transfer_to_*` function tool in `agent.tools` yourself, that tool's invocation is captured the same way — but that is not how `@openai/agents` normally routes handoffs.) The bare `handoffs: [agent]` shorthand (where the SDK builds the `Handoff` internally at run time) and the full per-agent multi-agent topology are **not** captured by this zero-dependency monkey-patch; use `@openai/agents`' `addTraceProcessor` for those (the same path noted below for faithful `llm_call` spans).
 
 ```typescript
 import { instrumentOpenAIAgents } from '@tracelyx/core';
-import { Agent, Runner } from '@openai/agents';
+import { Agent, Runner, run } from '@openai/agents';
 
-const agent = new Agent(...);
-instrumentOpenAIAgents(agent, tracelyx);
+const agent = new Agent({ name: 'assistant', tools: [/* ... */] });
 
-// or with a runner (wraps the run in an agent_step span and instruments
-// the passed agent's tools/handoffs):
-const runner = new Runner();
-instrumentOpenAIAgents(runner, tracelyx);
+// Option A — Runner:
+const runner = instrumentOpenAIAgents(new Runner(), tracelyx);
 const result = await runner.run(agent, input);
-// Spans are still created with the same traceId across all agents
+
+// Option B — the exported run():
+const tracedRun = instrumentOpenAIAgents(run, tracelyx);
+const result2 = await tracedRun(agent, input);
 ```
+
+> **Note:** the monkey-patch does not see individual model calls, so the integration does not create separate `llm_call` spans or full per-call token counts (tokens are a best-effort aggregate on the `agent_step` span when the `RunResult` exposes them). Faithful `llm_call` spans would require integrating with `@openai/agents`' `addTraceProcessor` — planned separately.
 
 ## CLI
 
@@ -118,3 +122,14 @@ Claude Code `.claude/settings.json`:
   }
 }
 ```
+
+## Security & limitations
+
+- **Payload capture without redaction (deferred):** the SDK sends full prompts/responses (`inputPayload`/`outputPayload`), tool arguments (`tool.arguments`), and hook inputs/outputs without masking. Secrets or PII contained in that data reach your observability backend (at-rest storage, access controlled by project permissions). SDK-side redaction/opt-out is planned in TASK-014. Until then, avoid putting secrets in prompts or tool arguments if you don't want them in traces.
+- **`error.message` / `error.stack` in attributes:** error spans carry the full exception message and stack trace (file paths, module structure). This is standard for observability SDKs (Sentry/OpenTelemetry), but these fields are not redacted.
+- **`llm.system_prompt_hash` is an MD5 fingerprint, not anonymization:** it groups identical system prompts. Do not assume it hides the content — a low-entropy prompt can be confirmed by brute-forcing candidate hashes.
+- **`tracelyx validate --api-key <key>`:** the key is visible in `ps` / shell history. Prefer the `TRACELYX_API_KEY` environment variable (the CLI warns on stderr when the flag is used).
+- **`tracelyx hook-listener`:** listens only on `127.0.0.1` and rejects request bodies larger than 1 MB. The `/hook` endpoint has no additional authorization — do not expose the port beyond loopback.
+- **Naming:** LangGraph node spans are named `langgraph.node.<node>` (readability); the bare node name is in the `langgraph.node_name` attribute.
+- **`validate`** uses `fetch` directly (not `TracelyxClient`) because it needs the HTTP status code (401) and receipt confirmation via `GET /v1/traces/:id`.
+- **Per-tenant batching:** span batches are split by `tenantId` before sending — each `TracePayload` carries its group's tenant.

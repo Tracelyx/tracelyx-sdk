@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { runValidateCommand } from '../../bin/tracelyx.js';
 
 function mockPostOkGetTrace(getResponses: Array<{ status: number; body?: unknown }>) {
@@ -13,6 +13,14 @@ function mockPostOkGetTrace(getResponses: Array<{ status: number; body?: unknown
 }
 
 describe('validate command', () => {
+  beforeEach(() => {
+    // Existing tests pass --api-key as a flag, which (post Task 12) triggers a
+    // stderr warning. Stub it here so that warning doesn't leak into test
+    // output; the two dedicated warning tests below install their own spy
+    // (which takes precedence for that test) to capture and assert on it.
+    vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+  });
+
   afterEach(() => {
     vi.unstubAllGlobals();
     vi.unstubAllEnvs();
@@ -419,6 +427,25 @@ describe('validate command', () => {
     expect(stdoutLines.join('')).toContain('accepted but could not be confirmed');
   });
 
+  it('exits 1 when POST is ok but GET rejects on every attempt (receipt not confirmed)', async () => {
+    vi.stubEnv('TRACELYX_VALIDATE_RETRY_DELAY_MS', '0');
+    const fetchMock = vi.fn().mockImplementation((_url: string, init?: RequestInit) => {
+      if (init?.method === 'POST') return Promise.resolve(new Response('{"accepted":1}', { status: 200 }));
+      return Promise.reject(new Error('boom')); // GET zawsze rzuca
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const out: string[] = [];
+    vi.spyOn(process.stdout, 'write').mockImplementation((c) => { out.push(String(c)); return true; });
+    const exitSpy = vi.spyOn(process, 'exit').mockImplementation(((code?: number) => {
+      throw new Error(`exit(${code})`);
+    }) as (code?: number) => never);
+
+    try { await runValidateCommand(['--api-key', 'tl_test', '--project-id', 'proj_1']); } catch { /* expected */ }
+
+    expect(exitSpy).toHaveBeenCalledWith(1);
+    expect(out.join('')).toContain('accepted but could not be confirmed');
+  });
+
   it('verifies tenant routing: exits 1 when GET returns different tenantId', async () => {
     vi.stubEnv('TRACELYX_VALIDATE_RETRY_DELAY_MS', '0');
     const fetchMock = mockPostOkGetTrace([{ status: 200, body: { id: 't-1', tenantId: 'other-corp' } }]);
@@ -479,5 +506,32 @@ describe('validate command', () => {
     expect(payload.projectId).toBe('proj_1');
     expect(payload.tenantId).toBe('acme-corp');
     expect((post[1].headers as Record<string, string>).Authorization).toBe('Bearer tl_test');
+  });
+
+  it('warns on stderr when --api-key is passed as a flag', async () => {
+    vi.stubEnv('TRACELYX_VALIDATE_RETRY_DELAY_MS', '0');
+    vi.stubGlobal('fetch', mockPostOkGetTrace([{ status: 200, body: { id: 't-1' } }]));
+    const err: string[] = [];
+    vi.spyOn(process.stderr, 'write').mockImplementation((c) => { err.push(String(c)); return true; });
+    vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+    vi.spyOn(process, 'exit').mockImplementation(((code?: number) => { throw new Error(`exit(${code})`); }) as (c?: number) => never);
+
+    try { await runValidateCommand(['--api-key', 'tl_test', '--project-id', 'proj_1']); } catch { /* expected */ }
+
+    expect(err.join('')).toMatch(/api-key.*visible|process list/i);
+  });
+
+  it('does NOT warn on stderr when api-key comes from env', async () => {
+    vi.stubEnv('TRACELYX_API_KEY', 'tl_env');
+    vi.stubEnv('TRACELYX_VALIDATE_RETRY_DELAY_MS', '0');
+    vi.stubGlobal('fetch', mockPostOkGetTrace([{ status: 200, body: { id: 't-1' } }]));
+    const err: string[] = [];
+    vi.spyOn(process.stderr, 'write').mockImplementation((c) => { err.push(String(c)); return true; });
+    vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+    vi.spyOn(process, 'exit').mockImplementation(((code?: number) => { throw new Error(`exit(${code})`); }) as (c?: number) => never);
+
+    try { await runValidateCommand(['--project-id', 'proj_1']); } catch { /* expected */ }
+
+    expect(err.join('')).not.toMatch(/api-key.*visible/i);
   });
 });

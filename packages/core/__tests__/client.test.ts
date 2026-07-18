@@ -62,6 +62,7 @@ describe('TracelyxClient', () => {
   });
 
   it('silently drops spans after 3 failed fetch attempts', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('network error')));
 
     const client = new TracelyxClient({
@@ -78,6 +79,7 @@ describe('TracelyxClient', () => {
     await expect(flushPromise).resolves.toBeUndefined();
 
     expect(fetch).toHaveBeenCalledTimes(3);
+    warn.mockRestore();
   });
 
   it('uses default endpoint when none is provided', async () => {
@@ -142,5 +144,74 @@ describe('TracelyxClient', () => {
       await client.flush();
       expect(fetch).not.toHaveBeenCalled();
     });
+  });
+
+  it('warns once when a batch is permanently dropped (non-retryable 4xx)', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('', { status: 403 })));
+    const client = new TracelyxClient({ apiKey: 'tl_test', projectId: 'proj_1' });
+
+    client.recordSpan({
+      id: '1', traceId: 't', parentSpanId: null, name: 'x', kind: 'custom',
+      startTime: 0, endTime: 0, durationMs: 0, status: 'ok', attributes: {},
+    });
+    await client.flush();
+
+    expect(warn).toHaveBeenCalled();
+    expect(warn.mock.calls.some((c) => String(c[0]).includes('[Tracelyx]'))).toBe(true);
+    warn.mockRestore();
+    vi.unstubAllGlobals();
+  });
+
+  it('warnDropOnce dedups: warns exactly once even when multiple tenant groups are permanently dropped', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('', { status: 403 })));
+    const client = new TracelyxClient({ apiKey: 'tl_test', projectId: 'proj_1' });
+    const mk = (id: string, tenantId: string) => ({
+      id, traceId: id, parentSpanId: null, name: 'x', kind: 'custom' as const,
+      startTime: 0, endTime: 0, durationMs: 0, status: 'ok' as const, attributes: {}, tenantId,
+    });
+    client.recordSpan(mk('a', 'acme'));
+    client.recordSpan(mk('b', 'globex')); // second tenant -> a second sendGroup, also 403
+    await client.flush();
+    expect(warn).toHaveBeenCalledTimes(1); // dedup across both permanently-dropped groups
+    warn.mockRestore();
+    vi.unstubAllGlobals();
+  });
+
+  it('flush() clears its timeout timer once drain wins (no leaked timer)', async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi.fn().mockResolvedValue(new Response('{"accepted":1}', { status: 200 }));
+    vi.stubGlobal('fetch', fetchMock);
+    const client = new TracelyxClient({ apiKey: 'tl_test', projectId: 'proj_1' });
+    client.recordSpan({ id: '1', traceId: 't', parentSpanId: null, name: 'x', kind: 'custom',
+      startTime: 0, endTime: 0, durationMs: 0, status: 'ok', attributes: {} });
+    await client.flush();
+    // drain resolved; the 10s timeout timer must have been cleared, leaving no pending timers
+    expect(vi.getTimerCount()).toBe(0);
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+  });
+
+  it('splits a mixed-tenant batch into one POST per tenant with correct envelope tenantId', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response('{"accepted":1}', { status: 200 }));
+    vi.stubGlobal('fetch', fetchMock);
+    const client = new TracelyxClient({ apiKey: 'tl_test', projectId: 'proj_1' });
+
+    const mk = (id: string, tenantId?: string) => ({
+      id, traceId: id, parentSpanId: null, name: 'x', kind: 'custom' as const,
+      startTime: 0, endTime: 0, durationMs: 0, status: 'ok' as const, attributes: {}, tenantId,
+    });
+    client.recordSpan(mk('a', 'acme'));
+    client.recordSpan(mk('b', 'globex'));
+    client.recordSpan(mk('c', 'acme'));
+    await client.flush();
+
+    const bodies = fetchMock.mock.calls.map((c) => JSON.parse(c[1].body));
+    const byTenant = Object.fromEntries(bodies.map((b) => [b.tenantId, b.spans.length]));
+    expect(byTenant['acme']).toBe(2);
+    expect(byTenant['globex']).toBe(1);
+    bodies.forEach((b) => b.spans.forEach((s: { tenantId?: string }) => expect(s.tenantId).toBe(b.tenantId)));
+    vi.unstubAllGlobals();
   });
 });

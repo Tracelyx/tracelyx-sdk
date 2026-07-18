@@ -58,6 +58,81 @@ function hashSystemPrompt(system: CreateParams['system']): string {
   return createHash('md5').update(text).digest('hex');
 }
 
+export interface StreamBlock {
+  type: string;
+  [key: string]: unknown;
+}
+
+export interface StreamState {
+  inputTokens?: number;
+  outputTokens?: number;
+  model?: string;
+  blocks: StreamBlock[];
+  partialJson: Record<number, string>;
+  sawStop: boolean;
+}
+
+interface RawStreamEvent {
+  type?: string;
+  index?: number;
+  message?: { model?: string; usage?: { input_tokens?: number; output_tokens?: number } };
+  content_block?: { type?: string; [key: string]: unknown };
+  delta?: { type?: string; text?: string; partial_json?: string; thinking?: string; signature?: string };
+  usage?: { output_tokens?: number };
+}
+
+export function newStreamState(): StreamState {
+  return { blocks: [], partialJson: {}, sawStop: false };
+}
+
+export function accumulateStreamEvent(state: StreamState, event: RawStreamEvent): void {
+  switch (event?.type) {
+    case 'message_start':
+      state.inputTokens = event.message?.usage?.input_tokens;
+      if (event.message?.usage?.output_tokens !== undefined) {
+        state.outputTokens = event.message.usage.output_tokens;
+      }
+      state.model = event.message?.model;
+      break;
+    case 'content_block_start':
+      if (typeof event.index === 'number' && event.content_block) {
+        state.blocks[event.index] = { ...event.content_block } as StreamBlock;
+      }
+      break;
+    case 'content_block_delta': {
+      if (typeof event.index !== 'number') break;
+      const block = state.blocks[event.index];
+      const delta = event.delta;
+      if (!block || !delta) break;
+      if (delta.type === 'text_delta') block.text = ((block.text as string) ?? '') + (delta.text ?? '');
+      else if (delta.type === 'input_json_delta')
+        state.partialJson[event.index] = (state.partialJson[event.index] ?? '') + (delta.partial_json ?? '');
+      else if (delta.type === 'thinking_delta') block.thinking = ((block.thinking as string) ?? '') + (delta.thinking ?? '');
+      else if (delta.type === 'signature_delta') block.signature = delta.signature;
+      break;
+    }
+    case 'content_block_stop': {
+      if (typeof event.index !== 'number') break;
+      const raw = state.partialJson[event.index];
+      const block = state.blocks[event.index];
+      if (raw !== undefined && block) {
+        try {
+          block.input = JSON.parse(raw);
+        } catch {
+          /* keep partial JSON as-is on parse failure */
+        }
+      }
+      break;
+    }
+    case 'message_delta':
+      if (event.usage?.output_tokens !== undefined) state.outputTokens = event.usage.output_tokens;
+      break;
+    case 'message_stop':
+      state.sawStop = true;
+      break;
+  }
+}
+
 export function instrumentAnthropic<T extends AnthropicLike>(
   client: T,
   tracelyxClient: TracelyxClient,

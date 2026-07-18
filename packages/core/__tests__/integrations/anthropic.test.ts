@@ -2,6 +2,20 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { instrumentAnthropic } from '../../src/integrations/anthropic.js';
 import { TracelyxClient } from '../../src/client.js';
 import type { TracePayload } from '../../src/types.js';
+import {
+  accumulateStreamEvent,
+  newStreamState,
+} from '../../src/integrations/anthropic.js';
+
+const STREAM_EVENTS = [
+  { type: 'message_start', message: { model: 'claude-3-5-sonnet-20241022', usage: { input_tokens: 12, output_tokens: 0 } } },
+  { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } },
+  { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'Hello' } },
+  { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: ' world' } },
+  { type: 'content_block_stop', index: 0 },
+  { type: 'message_delta', usage: { output_tokens: 7 } },
+  { type: 'message_stop' },
+];
 
 function makeAnthropicMock(response: unknown) {
   return { messages: { create: vi.fn().mockResolvedValue(response) } };
@@ -230,5 +244,39 @@ describe('instrumentAnthropic', () => {
     const span = body.spans[0];
     expect(span.attributes['agent.declared_tools']).toBeUndefined();
     expect(span.attributes['llm.tool_call_name']).toBeUndefined();
+  });
+});
+
+describe('accumulateStreamEvent', () => {
+  it('reconstructs text content and tokens from a full event sequence', () => {
+    const state = newStreamState();
+    for (const e of STREAM_EVENTS) accumulateStreamEvent(state, e);
+
+    expect(state.inputTokens).toBe(12);
+    expect(state.outputTokens).toBe(7);
+    expect(state.model).toBe('claude-3-5-sonnet-20241022');
+    expect(state.sawStop).toBe(true);
+    expect(state.blocks.filter(Boolean)).toEqual([{ type: 'text', text: 'Hello world' }]);
+  });
+
+  it('reconstructs tool_use input from input_json_delta fragments', () => {
+    const state = newStreamState();
+    const events = [
+      { type: 'message_start', message: { model: 'm', usage: { input_tokens: 20 } } },
+      { type: 'content_block_start', index: 0, content_block: { type: 'tool_use', id: 'tu_1', name: 'read_file' } },
+      { type: 'content_block_delta', index: 0, delta: { type: 'input_json_delta', partial_json: '{"path":' } },
+      { type: 'content_block_delta', index: 0, delta: { type: 'input_json_delta', partial_json: '"/etc/hosts"}' } },
+      { type: 'content_block_stop', index: 0 },
+    ];
+    for (const e of events) accumulateStreamEvent(state, e);
+
+    expect(state.blocks[0]).toEqual({ type: 'tool_use', id: 'tu_1', name: 'read_file', input: { path: '/etc/hosts' } });
+  });
+
+  it('marks sawStop false when the stream never completes', () => {
+    const state = newStreamState();
+    accumulateStreamEvent(state, STREAM_EVENTS[0]);
+    accumulateStreamEvent(state, STREAM_EVENTS[1]);
+    expect(state.sawStop).toBe(false);
   });
 });

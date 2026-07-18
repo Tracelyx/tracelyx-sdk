@@ -121,6 +121,8 @@ import { instrumentOpenAIAgents } from '@tracelyx/core';
 instrumentOpenAIAgents(runner, tracelyx, { tracing: addTraceProcessor });
 ```
 
+> **Cost aggregation note:** with `{ tracing }`, tokens appear on **two** spans per run — the `agent_step` (a run-level rollup summed across all model calls) and each per-call `llm_call`. Their token totals overlap, so a consumer must **not** sum both: aggregate `llm_call` spans for per-call cost, and use the `agent_step` rollup only for runs with no child `llm_call` spans (e.g. when tracing is off). The native ingest format preserves `span.kind` for exactly this dedup.
+
 The processor is registered once per client and emits an `llm_call` span per model
 call, nested under the run's `agent_step` when it fires inside the run. Without
 `{ tracing }`, behavior is unchanged (agent/tool spans only, with best-effort aggregate

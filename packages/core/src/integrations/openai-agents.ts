@@ -74,8 +74,12 @@ export class TracelyxTracingProcessor {
     const ctx = getActiveContext();
     const traceId = ctx?.traceId ?? span.traceId ?? randomUUID();
     const parentSpanId = ctx?.spanId ?? span.parentId ?? null;
-    const startTime = span.startedAt ? Date.parse(span.startedAt) : Date.now();
-    const endTime = span.endedAt ? Date.parse(span.endedAt) : Date.now();
+    const parseTs = (iso: string | undefined): number => {
+      const t = iso ? Date.parse(iso) : NaN;
+      return Number.isFinite(t) ? t : Date.now();
+    };
+    const startTime = parseTs(span.startedAt);
+    const endTime = parseTs(span.endedAt);
     const name = span.spanData?.type === 'generation' ? 'openai.generation' : 'openai.response';
 
     const attributes: Record<string, unknown> = {};

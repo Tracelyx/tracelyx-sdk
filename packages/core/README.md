@@ -92,7 +92,7 @@ for await (const event of app.streamEvents(input, { version: 'v2' })) {
 
 `instrumentOpenAIAgents()` accepts a **Runner** or the exported **`run`** function — these execute an agent in `@openai/agents` (the `Agent` class has no `.run()` method). It wraps the call in an `agent_step` span (named after the agent, with `openai.model`) and wraps the agent's tools (`tool.invoke`) in child `tool_call` spans. You can also pass an `Agent` object to instrument its tools and handoffs ahead of time; the span for the whole run then comes from the wrapped Runner/`run()`.
 
-`handoff.target_agent` is captured for handoffs declared as a `Handoff` instance — i.e. `handoff(agent)` placed in the agent's `handoffs` array (`new Agent({ handoffs: [handoff(billing)] })`). When such a handoff fires it emits a `handoff.<target>` span and is aggregated onto the run's `agent_step` span. (If you hand-place a `transfer_to_*` function tool in `agent.tools` yourself, that tool's invocation is captured the same way — but that is not how `@openai/agents` normally routes handoffs.) The bare `handoffs: [agent]` shorthand (where the SDK builds the `Handoff` internally at run time) and the full per-agent multi-agent topology are **not** captured by this zero-dependency monkey-patch; use `@openai/agents`' `addTraceProcessor` for those (the same path noted below for faithful `llm_call` spans).
+`handoff.target_agent` is captured for handoffs declared as a `Handoff` instance — i.e. `handoff(agent)` placed in the agent's `handoffs` array (`new Agent({ handoffs: [handoff(billing)] })`). When such a handoff fires it emits a `handoff.<target>` span and is aggregated onto the run's `agent_step` span. (If you hand-place a `transfer_to_*` function tool in `agent.tools` yourself, that tool's invocation is captured the same way — but that is not how `@openai/agents` normally routes handoffs.) The bare `handoffs: [agent]` shorthand (where the SDK builds the `Handoff` internally at run time) and the full per-agent multi-agent topology are **not** captured by this zero-dependency monkey-patch; use `@openai/agents`' `addTraceProcessor` for those (the same path used below for faithful `llm_call` spans).
 
 ```typescript
 import { instrumentOpenAIAgents } from '@tracelyx/core';
@@ -109,7 +109,22 @@ const tracedRun = instrumentOpenAIAgents(run, tracelyx);
 const result2 = await tracedRun(agent, input);
 ```
 
-> **Note:** the monkey-patch does not see individual model calls, so the integration does not create separate `llm_call` spans or full per-call token counts (tokens are a best-effort aggregate on the `agent_step` span when the `RunResult` exposes them). Faithful `llm_call` spans would require integrating with `@openai/agents`' `addTraceProcessor` — planned separately.
+Per-model-call `llm_call` spans (carrying `openai.model`, top-level `llmModel`, and
+prompt/completion token counts) are available **opt-in**: pass `@openai/agents`'
+`addTraceProcessor` as `{ tracing }`. It is **injected**, so `@tracelyx/core` never
+imports `@openai/agents` and stays zero-dependency:
+
+```ts
+import { addTraceProcessor } from '@openai/agents';
+import { instrumentOpenAIAgents } from '@tracelyx/core';
+
+instrumentOpenAIAgents(runner, tracelyx, { tracing: addTraceProcessor });
+```
+
+The processor is registered once per client and emits an `llm_call` span per model
+call, nested under the run's `agent_step` when it fires inside the run. Without
+`{ tracing }`, behavior is unchanged (agent/tool spans only, with best-effort aggregate
+tokens on the `agent_step` span). Requires `@openai/agents` tracing enabled (the default).
 
 ## CLI
 

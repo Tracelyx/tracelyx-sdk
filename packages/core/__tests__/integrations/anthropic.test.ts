@@ -291,6 +291,129 @@ describe('instrumentAnthropic', () => {
     expect(span.outputPayload).toBe(JSON.stringify([{ type: 'text', text: 'Hello world' }]));
     expect(span.attributes['llm.stream_incomplete']).toBeUndefined();
   });
+
+  it('marks stream_incomplete and records partial content on early break', async () => {
+    const anthropic = makeStreamingAnthropicMock(STREAM_EVENTS);
+    instrumentAnthropic(anthropic, client);
+
+    const stream = await anthropic.messages.create({
+      model: 'claude-3-5-sonnet-20241022',
+      max_tokens: 100,
+      messages: [{ role: 'user', content: 'Hi' }],
+      stream: true,
+    });
+    for await (const event of stream as AsyncIterable<{ type?: string }>) {
+      if (event.type === 'content_block_delta') break; // stop after first text delta
+    }
+
+    await client.flush();
+
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body) as TracePayload;
+    const span = body.spans.find((s) => s.kind === 'llm_call')!;
+    expect(span.attributes['llm.stream_incomplete']).toBe(true);
+    expect(span.outputPayload).toBe(JSON.stringify([{ type: 'text', text: 'Hello' }]));
+  });
+
+  it('records error status when the stream throws mid-iteration', async () => {
+    const events = [
+      { type: 'message_start', message: { model: 'm', usage: { input_tokens: 12 } } },
+      { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } },
+      new Error('connection reset'),
+    ];
+    const anthropic = makeStreamingAnthropicMock(events);
+    instrumentAnthropic(anthropic, client);
+
+    const stream = await anthropic.messages.create({
+      model: 'm',
+      max_tokens: 10,
+      messages: [],
+      stream: true,
+    });
+
+    await expect(
+      (async () => {
+        for await (const _event of stream as AsyncIterable<unknown>) {
+          void _event;
+        }
+      })(),
+    ).rejects.toThrow('connection reset');
+
+    await client.flush();
+
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body) as TracePayload;
+    const span = body.spans.find((s) => s.kind === 'llm_call')!;
+    expect(span.status).toBe('error');
+    expect(span.attributes['error.message']).toBe('connection reset');
+    expect(span.attributes['llm.stream_incomplete']).toBe(true);
+  });
+
+  it('emits llm.tool_call_name for a streamed tool_use block', async () => {
+    const events = [
+      { type: 'message_start', message: { model: 'm', usage: { input_tokens: 20 } } },
+      { type: 'content_block_start', index: 0, content_block: { type: 'tool_use', id: 'tu_1', name: 'read_file' } },
+      { type: 'content_block_delta', index: 0, delta: { type: 'input_json_delta', partial_json: '{"path":"/x"}' } },
+      { type: 'content_block_stop', index: 0 },
+      { type: 'message_delta', usage: { output_tokens: 8 } },
+      { type: 'message_stop' },
+    ];
+    const anthropic = makeStreamingAnthropicMock(events);
+    instrumentAnthropic(anthropic, client);
+
+    const stream = await anthropic.messages.create({ model: 'm', max_tokens: 50, messages: [], stream: true });
+    for await (const _event of stream as AsyncIterable<unknown>) {
+      void _event;
+    }
+
+    await client.flush();
+
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body) as TracePayload;
+    const span = body.spans.find((s) => s.kind === 'llm_call')!;
+    expect(span.attributes['llm.tool_call_name']).toBe('read_file');
+    expect(span.completionTokens).toBe(8);
+  });
+
+  it('records an error span when create() rejects before streaming starts', async () => {
+    const anthropic = { messages: { create: vi.fn().mockRejectedValue(new Error('401 unauthorized')) } };
+    instrumentAnthropic(anthropic, client);
+
+    await expect(
+      anthropic.messages.create({ model: 'm', max_tokens: 10, messages: [], stream: true }),
+    ).rejects.toThrow('401 unauthorized');
+
+    await client.flush();
+
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body) as TracePayload;
+    const span = body.spans.find((s) => s.kind === 'llm_call')!;
+    expect(span.status).toBe('error');
+    expect(span.attributes['error.message']).toBe('401 unauthorized');
+  });
+
+  it('produces exactly one span when messages.stream() funnels through create()', async () => {
+    const anthropic: {
+      messages: {
+        create: ReturnType<typeof vi.fn>;
+        stream?: (params: Record<string, unknown>) => Promise<unknown>;
+      };
+    } = { messages: { create: vi.fn().mockResolvedValue(fakeStream(STREAM_EVENTS)) } };
+    anthropic.messages.stream = (params: Record<string, unknown>) =>
+      anthropic.messages.create({ ...params, stream: true });
+
+    instrumentAnthropic(anthropic, client);
+
+    const stream = await anthropic.messages.stream({
+      model: 'claude-3-5-sonnet-20241022',
+      max_tokens: 100,
+      messages: [{ role: 'user', content: 'Hi' }],
+    });
+    for await (const _event of stream as AsyncIterable<unknown>) {
+      void _event;
+    }
+
+    await client.flush();
+
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body) as TracePayload;
+    expect(body.spans.filter((s) => s.kind === 'llm_call')).toHaveLength(1);
+  });
 });
 
 describe('accumulateStreamEvent', () => {

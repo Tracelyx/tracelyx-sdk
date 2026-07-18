@@ -8,6 +8,114 @@ const INSTRUMENTED = Symbol('tracelyx.instrumented');
 const TOOL_INSTRUMENTED = Symbol('tracelyx.tool.instrumented');
 const HANDOFF_INSTRUMENTED = Symbol('tracelyx.handoff.instrumented');
 
+interface SdkResponseSpanData {
+  type: 'response';
+  response_id?: string;
+  _response?: { model?: string; usage?: { input_tokens?: number; output_tokens?: number } };
+}
+
+interface SdkGenerationSpanData {
+  type: 'generation';
+  model?: string;
+  // GenerationUsageData: tokens live under `usage` (snake_case) — probe-confirmed
+  // against @openai/agents-core@0.13.0 (there is no output[0].usage path).
+  usage?: { input_tokens?: number; output_tokens?: number };
+}
+
+interface SdkSpanLike {
+  spanData?: SdkResponseSpanData | SdkGenerationSpanData | { type?: string };
+  traceId?: string;
+  spanId?: string;
+  parentId?: string | null;
+  startedAt?: string;
+  endedAt?: string;
+  error?: unknown;
+}
+
+function extractLlmSpan(
+  span: SdkSpanLike,
+): { model?: string; promptTokens?: number; completionTokens?: number } | null {
+  const data = span.spanData;
+  if (!data) return null;
+  if (data.type === 'response') {
+    const r = (data as SdkResponseSpanData)._response;
+    if (!r) return null;
+    return { model: r.model, promptTokens: r.usage?.input_tokens, completionTokens: r.usage?.output_tokens };
+  }
+  if (data.type === 'generation') {
+    const g = data as SdkGenerationSpanData;
+    return { model: g.model, promptTokens: g.usage?.input_tokens, completionTokens: g.usage?.output_tokens };
+  }
+  return null;
+}
+
+/**
+ * TASK-212: bridges @openai/agents tracing spans into Tracelyx llm_call spans.
+ * Registered via an injected addTraceProcessor so packages/core stays
+ * zero-dependency (the SDK is never imported here).
+ *
+ * Linkage: prefers the active agent_step context (AsyncLocalStorage) so the
+ * llm_call nests under the run; falls back to the SDK's own trace/span ids
+ * (orphan, rendered top-level downstream) when no context is active.
+ */
+export class TracelyxTracingProcessor {
+  constructor(private readonly tracelyxClient: TracelyxClient) {}
+
+  onTraceStart(): void {}
+  onTraceEnd(): void {}
+  onSpanStart(): void {}
+  shutdown(): void {}
+  forceFlush(): void {}
+
+  onSpanEnd(span: SdkSpanLike): void {
+    const info = extractLlmSpan(span);
+    if (!info) return;
+
+    const ctx = getActiveContext();
+    const traceId = ctx?.traceId ?? span.traceId ?? randomUUID();
+    const parentSpanId = ctx?.spanId ?? span.parentId ?? null;
+    const parseTs = (iso: string | undefined): number => {
+      const t = iso ? Date.parse(iso) : NaN;
+      return Number.isFinite(t) ? t : Date.now();
+    };
+    const startTime = parseTs(span.startedAt);
+    const endTime = parseTs(span.endedAt);
+    const name = span.spanData?.type === 'generation' ? 'openai.generation' : 'openai.response';
+
+    const attributes: Record<string, unknown> = {};
+    if (info.model !== undefined) attributes['openai.model'] = info.model;
+    if (span.error) {
+      // span.error is a SpanError { message, data } (NOT an Error instance) per the SDK probe.
+      attributes['error.type'] = classifyError(span.error);
+      const errMessage =
+        span.error instanceof Error
+          ? span.error.message
+          : typeof (span.error as { message?: unknown }).message === 'string'
+            ? (span.error as { message: string }).message
+            : undefined;
+      if (errMessage !== undefined) attributes['error.message'] = errMessage;
+      if (span.error instanceof Error) attributes['error.name'] = span.error.name;
+    }
+
+    this.tracelyxClient.recordSpan({
+      id: span.spanId ?? randomUUID(),
+      traceId,
+      parentSpanId,
+      name,
+      kind: 'llm_call',
+      startTime,
+      endTime,
+      durationMs: Math.max(0, endTime - startTime),
+      status: span.error ? 'error' : 'ok',
+      attributes,
+      tenantId: ctx?.tenantId,
+      llmModel: info.model,
+      promptTokens: info.promptTokens,
+      completionTokens: info.completionTokens,
+    });
+  }
+}
+
 interface ToolLike {
   name: string;
   invoke?(...args: unknown[]): Promise<unknown>;
@@ -205,7 +313,29 @@ function instrumentHandoffTargets(handoffs: unknown[], tracelyxClient: TracelyxC
   }
 }
 
-export function instrumentOpenAIAgents<T>(target: T, tracelyxClient: TracelyxClient): T {
+interface InstrumentOptions {
+  tracing?: (processor: TracelyxTracingProcessor) => void;
+}
+
+const TRACING_REGISTERED = new WeakSet<TracelyxClient>();
+
+function registerTracingProcessor(
+  addTraceProcessor: (processor: TracelyxTracingProcessor) => void,
+  tracelyxClient: TracelyxClient,
+): void {
+  if (TRACING_REGISTERED.has(tracelyxClient)) return;
+  TRACING_REGISTERED.add(tracelyxClient);
+  addTraceProcessor(new TracelyxTracingProcessor(tracelyxClient));
+}
+
+export function instrumentOpenAIAgents<T>(
+  target: T,
+  tracelyxClient: TracelyxClient,
+  options?: InstrumentOptions,
+): T {
+  if (options?.tracing) {
+    registerTracingProcessor(options.tracing, tracelyxClient);
+  }
   // 1) Exported run(agent, input) function: return a wrapped function
   //    (call-site: const run = instrumentOpenAIAgents(run, client)).
   if (typeof target === 'function') {

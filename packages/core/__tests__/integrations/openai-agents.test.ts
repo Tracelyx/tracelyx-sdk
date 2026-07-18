@@ -4,6 +4,7 @@ import {
   TracelyxTracingProcessor,
 } from '../../src/integrations/openai-agents.js';
 import { TracelyxClient } from '../../src/client.js';
+import { runWithContext } from '../../src/tracer.js';
 import type { TracePayload } from '../../src/types.js';
 
 // The real @openai/agents SDK executes an agent via Runner.run(agent, input) or the
@@ -567,5 +568,41 @@ describe('instrumentOpenAIAgents', () => {
     expect(span.status).toBe('error');
     expect(span.attributes['error.type']).toBe('rate_limit');
     expect(span.attributes['error.message']).toBe('rate limit exceeded');
+  });
+
+  it('nests the llm_call under the active agent_step via AsyncLocalStorage', async () => {
+    const processor = new TracelyxTracingProcessor(client);
+
+    runWithContext({ spanId: 'agent-step-1', traceId: 'trace-1', tenantId: 'acme' }, () => {
+      processor.onSpanEnd({
+        spanData: { type: 'response', _response: { model: 'gpt-4o', usage: { input_tokens: 1, output_tokens: 2 } } },
+        traceId: 'sdk-trace', spanId: 'sdk-span', parentId: 'sdk-parent',
+        startedAt: '2026-07-18T10:00:00.000Z', endedAt: '2026-07-18T10:00:00.100Z',
+      });
+    });
+
+    await client.flush();
+
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body) as TracePayload;
+    const span = body.spans.find((s) => s.kind === 'llm_call')!;
+    expect(span.traceId).toBe('trace-1');
+    expect(span.parentSpanId).toBe('agent-step-1');
+    expect(span.tenantId).toBe('acme');
+  });
+
+  it('falls back to SDK ids when no agent_step context is active', async () => {
+    const processor = new TracelyxTracingProcessor(client);
+    processor.onSpanEnd({
+      spanData: { type: 'response', _response: { model: 'gpt-4o', usage: { input_tokens: 1, output_tokens: 2 } } },
+      traceId: 'sdk-trace', spanId: 'sdk-span', parentId: 'sdk-parent',
+      startedAt: '2026-07-18T10:00:00.000Z', endedAt: '2026-07-18T10:00:00.100Z',
+    });
+
+    await client.flush();
+
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body) as TracePayload;
+    const span = body.spans.find((s) => s.kind === 'llm_call')!;
+    expect(span.traceId).toBe('sdk-trace');
+    expect(span.parentSpanId).toBe('sdk-parent');
   });
 });

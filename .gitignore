@@ -12,3 +12,6 @@ pnpm-debug.log*
 .idea/
 .vscode/settings.json
 .env*.local
+
+# Process/planning docs (brainstorming, specs, plans) — not tracked in the repo
+docs/superpowers/

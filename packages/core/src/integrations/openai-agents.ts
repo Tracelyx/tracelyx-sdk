@@ -309,7 +309,29 @@ function instrumentHandoffTargets(handoffs: unknown[], tracelyxClient: TracelyxC
   }
 }
 
-export function instrumentOpenAIAgents<T>(target: T, tracelyxClient: TracelyxClient): T {
+interface InstrumentOptions {
+  tracing?: (processor: TracelyxTracingProcessor) => void;
+}
+
+const TRACING_REGISTERED = new WeakSet<TracelyxClient>();
+
+function registerTracingProcessor(
+  addTraceProcessor: (processor: TracelyxTracingProcessor) => void,
+  tracelyxClient: TracelyxClient,
+): void {
+  if (TRACING_REGISTERED.has(tracelyxClient)) return;
+  TRACING_REGISTERED.add(tracelyxClient);
+  addTraceProcessor(new TracelyxTracingProcessor(tracelyxClient));
+}
+
+export function instrumentOpenAIAgents<T>(
+  target: T,
+  tracelyxClient: TracelyxClient,
+  options?: InstrumentOptions,
+): T {
+  if (options?.tracing) {
+    registerTracingProcessor(options.tracing, tracelyxClient);
+  }
   // 1) Exported run(agent, input) function: return a wrapped function
   //    (call-site: const run = instrumentOpenAIAgents(run, client)).
   if (typeof target === 'function') {

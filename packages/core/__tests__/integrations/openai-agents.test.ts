@@ -466,6 +466,46 @@ describe('instrumentOpenAIAgents', () => {
     expect(targets).toEqual(['billing', 'refunds']);
   });
 
+  it('registers a tracing processor when options.tracing is provided', () => {
+    const processors: unknown[] = [];
+    const addTraceProcessor = (p: TracelyxTracingProcessor): void => {
+      processors.push(p);
+    };
+    const runner = { run: vi.fn().mockResolvedValue({}) };
+
+    instrumentOpenAIAgents(runner, client, { tracing: addTraceProcessor });
+
+    expect(processors).toHaveLength(1);
+    expect(processors[0]).toBeInstanceOf(TracelyxTracingProcessor);
+  });
+
+  it('does not double-register the tracing processor for the same client', () => {
+    const processors: unknown[] = [];
+    const addTraceProcessor = (p: TracelyxTracingProcessor): void => {
+      processors.push(p);
+    };
+    const runnerA = { run: vi.fn().mockResolvedValue({}) };
+    const runnerB = { run: vi.fn().mockResolvedValue({}) };
+
+    instrumentOpenAIAgents(runnerA, client, { tracing: addTraceProcessor });
+    instrumentOpenAIAgents(runnerB, client, { tracing: addTraceProcessor });
+
+    expect(processors).toHaveLength(1);
+  });
+
+  it('does not emit llm_call spans when options.tracing is omitted', async () => {
+    const agent = { name: 'A', model: 'gpt-4o' };
+    const runner = { run: vi.fn().mockResolvedValue({}) };
+    instrumentOpenAIAgents(runner, client);
+
+    await runner.run(agent, 'x');
+    await client.flush();
+
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body) as TracePayload;
+    expect(body.spans.every((s) => s.kind !== 'llm_call')).toBe(true);
+    expect(body.spans[0].attributes['openai.model']).toBe('gpt-4o'); // unchanged agent_step behavior
+  });
+
   it('maps a response span to a top-level-fielded llm_call span', async () => {
     const processor = new TracelyxTracingProcessor(client);
     processor.onSpanEnd({

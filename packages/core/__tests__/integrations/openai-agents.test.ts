@@ -605,4 +605,20 @@ describe('instrumentOpenAIAgents', () => {
     expect(span.traceId).toBe('sdk-trace');
     expect(span.parentSpanId).toBe('sdk-parent');
   });
+
+  it('guards against a malformed ISO timestamp (finite duration, no throw)', async () => {
+    const processor = new TracelyxTracingProcessor(client);
+    expect(() =>
+      processor.onSpanEnd({
+        spanData: { type: 'response', _response: { model: 'gpt-4o', usage: { input_tokens: 1, output_tokens: 2 } } },
+        traceId: 't', spanId: 's', parentId: null,
+        startedAt: 'not-a-date', endedAt: 'also-bad',
+      }),
+    ).not.toThrow();
+    await client.flush();
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body) as TracePayload;
+    const span = body.spans.find((s) => s.kind === 'llm_call')!;
+    expect(Number.isFinite(span.durationMs)).toBe(true);
+    expect(span.durationMs).toBeGreaterThanOrEqual(0);
+  });
 });

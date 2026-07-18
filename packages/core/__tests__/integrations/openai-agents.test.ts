@@ -1,5 +1,8 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { instrumentOpenAIAgents } from '../../src/integrations/openai-agents.js';
+import {
+  instrumentOpenAIAgents,
+  TracelyxTracingProcessor,
+} from '../../src/integrations/openai-agents.js';
 import { TracelyxClient } from '../../src/client.js';
 import type { TracePayload } from '../../src/types.js';
 
@@ -461,5 +464,68 @@ describe('instrumentOpenAIAgents', () => {
       .map((s) => s.attributes['handoff.target_agent'])
       .sort();
     expect(targets).toEqual(['billing', 'refunds']);
+  });
+
+  it('maps a response span to a top-level-fielded llm_call span', async () => {
+    const processor = new TracelyxTracingProcessor(client);
+    processor.onSpanEnd({
+      spanData: { type: 'response', response_id: 'resp_1', _response: { model: 'gpt-4o', usage: { input_tokens: 11, output_tokens: 22 } } },
+      traceId: 'sdk-trace', spanId: 'sdk-span', parentId: null,
+      startedAt: '2026-07-18T10:00:00.000Z', endedAt: '2026-07-18T10:00:01.000Z', error: null,
+    });
+    await client.flush();
+
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body) as TracePayload;
+    const span = body.spans.find((s) => s.kind === 'llm_call')!;
+    expect(span.name).toBe('openai.response');
+    expect(span.llmModel).toBe('gpt-4o');
+    expect(span.promptTokens).toBe(11);
+    expect(span.completionTokens).toBe(22);
+    expect(span.attributes['openai.model']).toBe('gpt-4o');
+    expect(span.durationMs).toBe(1000);
+    expect(span.status).toBe('ok');
+  });
+
+  it('maps a generation span (top-level usage) to an llm_call span', async () => {
+    const processor = new TracelyxTracingProcessor(client);
+    processor.onSpanEnd({
+      spanData: { type: 'generation', model: 'gpt-4o-mini', usage: { input_tokens: 5, output_tokens: 9 } },
+      traceId: 't', spanId: 's', parentId: null,
+      startedAt: '2026-07-18T10:00:00.000Z', endedAt: '2026-07-18T10:00:00.500Z',
+    });
+    await client.flush();
+
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body) as TracePayload;
+    const span = body.spans.find((s) => s.kind === 'llm_call')!;
+    expect(span.name).toBe('openai.generation');
+    expect(span.llmModel).toBe('gpt-4o-mini');
+    expect(span.promptTokens).toBe(5);
+    expect(span.completionTokens).toBe(9);
+  });
+
+  it('ignores non-LLM SDK spans (agent, function, custom)', async () => {
+    const processor = new TracelyxTracingProcessor(client);
+    processor.onSpanEnd({ spanData: { type: 'agent' } });
+    processor.onSpanEnd({ spanData: { type: 'function' } });
+    processor.onSpanEnd({ spanData: { type: 'custom' } });
+    await client.flush();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('sets error status on the llm_call span when the SDK span errored', async () => {
+    const processor = new TracelyxTracingProcessor(client);
+    processor.onSpanEnd({
+      spanData: { type: 'response', _response: { model: 'gpt-4o', usage: { input_tokens: 1, output_tokens: 0 } } },
+      traceId: 't', spanId: 's', parentId: null,
+      startedAt: '2026-07-18T10:00:00.000Z', endedAt: '2026-07-18T10:00:00.010Z',
+      error: { message: 'rate limit exceeded' }, // SpanError { message, data } — NOT an Error instance (probe-confirmed)
+    });
+    await client.flush();
+
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body) as TracePayload;
+    const span = body.spans.find((s) => s.kind === 'llm_call')!;
+    expect(span.status).toBe('error');
+    expect(span.attributes['error.type']).toBe('rate_limit');
+    expect(span.attributes['error.message']).toBe('rate limit exceeded');
   });
 });

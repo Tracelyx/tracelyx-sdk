@@ -50,6 +50,20 @@ try {
 }
 ```
 
+### Anthropic
+
+#### Streaming
+
+Streaming calls are traced automatically — both `messages.create({ stream: true })`
+and `messages.stream(...)` (which funnels through `create`). The `llm_call` span is
+recorded when the stream **completes**, so `durationMs` covers the full generation and
+`promptTokens` / `completionTokens` / `outputPayload` are populated from the streamed
+events. If the consumer breaks early or the stream errors, the span is still recorded
+with `attributes['llm.stream_incomplete'] = true`.
+
+> Limitation: a consumer that reads the stream **only** via `stream.tee()` or
+> `stream.toReadableStream()` (never `for await`) is not traced.
+
 ### LangGraph
 
 LangGraph integration instruments both `stream()` and `streamEvents()` calls, creating per-node spans. `streamEvents()` gives accurate per-node start/end times (from `on_chain_start`/`on_chain_end` events; requires `@langchain/langgraph >= 0.2.0`). The `stream()` path derives one span per node from update chunks and approximates node duration as the time between successive chunks — it requires `streamMode: 'updates'` (under the default `'values'` mode a chunk is the full state keyed by channels, not nodes, so no node spans are emitted). For per-node timing regardless of mode, prefer `streamEvents()`.

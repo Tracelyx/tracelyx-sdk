@@ -28,6 +28,7 @@ interface CreateParams {
   temperature?: number;
   max_tokens?: number;
   tools?: ToolDefinition[];
+  stream?: boolean;
   [key: string]: unknown;
 }
 
@@ -133,6 +134,35 @@ export function accumulateStreamEvent(state: StreamState, event: RawStreamEvent)
   }
 }
 
+function traceStream<S extends object>(
+  stream: S,
+  onDone: (state: StreamState, error: unknown) => void,
+): S {
+  const streamAsAny = stream as unknown as {
+    [Symbol.asyncIterator]: () => AsyncIterableIterator<unknown>;
+  };
+  const getOriginalIterator = streamAsAny[Symbol.asyncIterator].bind(stream);
+  streamAsAny[Symbol.asyncIterator] = async function* (): AsyncGenerator<unknown> {
+    const state = newStreamState();
+    let caught: unknown = null;
+    try {
+      // for-await propagates .return() to the upstream iterator when the consumer
+      // breaks early, so an early break also closes the underlying HTTP read
+      // (matches the SDK's native behavior — do not fight it).
+      for await (const event of getOriginalIterator() as AsyncIterable<unknown>) {
+        accumulateStreamEvent(state, event as never);
+        yield event;
+      }
+    } catch (error) {
+      caught = error;
+      throw error;
+    } finally {
+      onDone(state, caught);
+    }
+  };
+  return stream;
+}
+
 export function instrumentAnthropic<T extends AnthropicLike>(
   client: T,
   tracelyxClient: TracelyxClient,
@@ -158,6 +188,83 @@ export function instrumentAnthropic<T extends AnthropicLike>(
       attributes['agent.declared_tools'] = params.tools.map((t) => t.name);
     }
 
+    const recordError = (error: unknown): void => {
+      attributes['error.type'] = classifyError(error);
+      if (error instanceof Error) {
+        attributes['error.message'] = error.message;
+        attributes['error.stack'] = error.stack;
+        attributes['error.name'] = error.name;
+      }
+    };
+
+    const emit = (fields: {
+      status: 'ok' | 'error';
+      endTime: number;
+      outputPayload?: string;
+      llmModel?: string;
+      promptTokens?: number;
+      completionTokens?: number;
+    }): void => {
+      const span: SpanPayload = {
+        id: spanId,
+        traceId,
+        parentSpanId,
+        name: 'anthropic.messages.create',
+        kind: 'llm_call',
+        startTime,
+        endTime: fields.endTime,
+        durationMs: fields.endTime - startTime,
+        status: fields.status,
+        attributes,
+        tenantId: ctx?.tenantId,
+        inputPayload: JSON.stringify(params.messages),
+        outputPayload: fields.outputPayload,
+        llmModel: fields.llmModel ?? params.model,
+        promptTokens: fields.promptTokens,
+        completionTokens: fields.completionTokens,
+      };
+      tracelyxClient.recordSpan(span);
+    };
+
+    // ── Streaming branch ──────────────────────────────────────────────
+    if (params.stream === true) {
+      attributes['llm.stream'] = true;
+      let stream: AnthropicResponse;
+      try {
+        stream = await originalCreate(params);
+      } catch (error) {
+        recordError(error);
+        emit({ status: 'error', endTime: Date.now() });
+        throw error;
+      }
+      return traceStream(stream as unknown as object, (state, error) => {
+        const content = state.blocks.filter(Boolean);
+        const toolUse = content.find(
+          (b): b is StreamBlock & { name: string } =>
+            b.type === 'tool_use' && typeof b['name'] === 'string',
+        );
+        if (toolUse) attributes['llm.tool_call_name'] = toolUse['name'];
+        attributes['llm.prompt_tokens'] = state.inputTokens;
+        attributes['llm.completion_tokens'] = state.outputTokens;
+        if (!state.sawStop) attributes['llm.stream_incomplete'] = true;
+
+        let status: 'ok' | 'error' = 'ok';
+        if (error) {
+          status = 'error';
+          recordError(error);
+        }
+        emit({
+          status,
+          endTime: Date.now(),
+          outputPayload: JSON.stringify(content),
+          llmModel: state.model ?? params.model,
+          promptTokens: state.inputTokens,
+          completionTokens: state.outputTokens,
+        });
+      }) as unknown as AnthropicResponse;
+    }
+
+    // ── Non-streaming branch (unchanged behavior) ─────────────────────
     let response: AnthropicResponse | undefined;
     let status: 'ok' | 'error' = 'ok';
 
@@ -177,34 +284,18 @@ export function instrumentAnthropic<T extends AnthropicLike>(
       return response;
     } catch (error) {
       status = 'error';
-      attributes['error.type'] = classifyError(error);
-      if (error instanceof Error) {
-        attributes['error.message'] = error.message;
-        attributes['error.stack'] = error.stack;
-        attributes['error.name'] = error.name;
-      }
+      recordError(error);
       throw error;
     } finally {
-      const endTime = Date.now();
-      const span: SpanPayload = {
-        id: spanId,
-        traceId,
-        parentSpanId,
-        name: 'anthropic.messages.create',
-        kind: 'llm_call',
-        startTime,
-        endTime,
-        durationMs: endTime - startTime,
+      emit({
         status,
-        attributes,
-        tenantId: ctx?.tenantId,
-        inputPayload: JSON.stringify(params.messages),
-        outputPayload: response?.content !== undefined ? JSON.stringify(response.content) : undefined,
+        endTime: Date.now(),
+        outputPayload:
+          response?.content !== undefined ? JSON.stringify(response.content) : undefined,
         llmModel: params.model,
         promptTokens: response?.usage?.input_tokens,
         completionTokens: response?.usage?.output_tokens,
-      };
-      tracelyxClient.recordSpan(span);
+      });
     }
   }
 

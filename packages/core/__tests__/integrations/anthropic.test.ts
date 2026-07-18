@@ -21,6 +21,22 @@ function makeAnthropicMock(response: unknown) {
   return { messages: { create: vi.fn().mockResolvedValue(response) } };
 }
 
+function fakeStream(events: unknown[]) {
+  return {
+    controller: { abort: vi.fn() },
+    async *[Symbol.asyncIterator]() {
+      for (const event of events) {
+        if (event instanceof Error) throw event;
+        yield event;
+      }
+    },
+  };
+}
+
+function makeStreamingAnthropicMock(events: unknown[]) {
+  return { messages: { create: vi.fn().mockResolvedValue(fakeStream(events)) } };
+}
+
 const OK_RESPONSE = {
   content: [{ type: 'text', text: 'Hello' }],
   usage: { input_tokens: 10, output_tokens: 5 },
@@ -244,6 +260,36 @@ describe('instrumentAnthropic', () => {
     const span = body.spans[0];
     expect(span.attributes['agent.declared_tools']).toBeUndefined();
     expect(span.attributes['llm.tool_call_name']).toBeUndefined();
+  });
+
+  it('creates one llm_call span for a streaming create({ stream: true })', async () => {
+    const anthropic = makeStreamingAnthropicMock(STREAM_EVENTS);
+    instrumentAnthropic(anthropic, client);
+
+    const stream = await anthropic.messages.create({
+      model: 'claude-3-5-sonnet-20241022',
+      max_tokens: 100,
+      messages: [{ role: 'user', content: 'Hi' }],
+      stream: true,
+    });
+    for await (const _event of stream as AsyncIterable<unknown>) {
+      void _event;
+    }
+
+    await client.flush();
+
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body) as TracePayload;
+    const spans = body.spans.filter((s) => s.kind === 'llm_call');
+    expect(spans).toHaveLength(1);
+    const span = spans[0];
+    expect(span.name).toBe('anthropic.messages.create');
+    expect(span.attributes['llm.stream']).toBe(true);
+    expect(span.status).toBe('ok');
+    expect(span.promptTokens).toBe(12);
+    expect(span.completionTokens).toBe(7);
+    expect(span.llmModel).toBe('claude-3-5-sonnet-20241022');
+    expect(span.outputPayload).toBe(JSON.stringify([{ type: 'text', text: 'Hello world' }]));
+    expect(span.attributes['llm.stream_incomplete']).toBeUndefined();
   });
 });
 
